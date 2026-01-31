@@ -1,0 +1,112 @@
+# This is a YAML file 
+# parameters for preprocessing
+preprocessing:
+  cropping: # cropping options
+    start_raman_shift_cm: 624.573
+    end_raman_shift_cm: 1784.104
+  baseline_correction: #airPLS
+    lam: 1000
+    diff_order: 1
+    max_iter: 15
+    tol: 0.001
+  cosmic_rays_removal: # WhitakerHayes's modified z-scores filtering
+    kernel_size: 2
+    threshold: 3.5
+  smoothing: #Savitzky-Golay filter
+    window_length: 9
+    polyorder: 2
+  normalization_type: # normalization options
+    by_max
+
+augmentation:
+  default_augmentation_steps:
+    - baseline
+    - amplification
+    - shot_noise
+    - dark_current_noise
+    - photo_response_non_uniformity
+    - cosmic_ray
+
+    
+  normalization: # normalization options
+    normalization_type_options: # by_max or by_area
+      by_max
+
+  amplification: # spectrum_amplifying_factor
+    spectrum_amplifying_factor: 
+      low: 200
+      high: 1500  # Uniform
+
+  shot_noise: # photon shot noise
+    noise_type: poisson
+    lam: 
+      low: 20 # lambda for poisson noise
+      high: 50
+
+  dark_current_noise: #dark_current_shot_noise
+    noise_type: poisson
+    lam: 
+      low: 20 # lambda for poisson noise
+      high: 50
+
+  photo_response_non_uniformity: #photo_response_non_uniformity
+    noise_type: gaussian
+    mean: 
+      low: 50
+      high: 100
+    std: 
+      low: 25
+      high: 50
+
+  FPN_noise: #dark_signal_FPN_noise
+    noise_type: lognormal
+    mean: 
+      low: 50
+      high: 100
+    sigma: 
+      low: 25
+      high: 50
+
+  horizontal_shift: #instrumental_horizontal_shift
+    low: 0.5
+    high: 1.5
+    # The unit is cm-1   
+
+  convoluting_gaussian:
+    guassian_std:
+      low: 0.3 # gussian std
+      high: 0.8
+
+  cosmic_ray:
+    spike_number: 
+      low: 0
+      high: 5 
+    spike_amplitude: 
+      low: 2
+      high: 3
+
+  baseline: 
+    baseline_type_options: 
+      - poly
+    baseline_amplifying_factor: 
+      low: 1
+      high: 3 # Uniform
+    poly_orders: 
+      low: 1
+      high: 3
+    poly_coefficients:
+      low: 0.000001
+      high: 0.0000001
+    sine:
+      sine_amplitude: 
+        low: 1
+        high: 5
+      sine_frequency: 
+        low: 2
+        high: 15
+      sine_phase:
+        low: 0
+        high: 2
+    baseline_offset:
+      low: 500
+      high: 4000

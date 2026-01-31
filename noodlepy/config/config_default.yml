@@ -1,0 +1,120 @@
+# This is a YAML file 
+# parameters for preprocessing
+preprocessing:
+  cropping: # cropping options
+    start_raman_shift_cm: 662.697 #624.573\
+    end_raman_shift_cm: 1784.104
+  baseline_correction: #airPLS
+    lam: 100000
+    diff_order: 1
+    max_iter: 15
+    tol: 0.005
+  cosmic_rays_removal: # WhitakerHayes's modified z-scores filtering
+    threshold: 10
+  smoothing: #Savitzky-Golay filter
+    window_length: 15
+    polyorder: 3
+  normalization_type: # normalization options
+    by_max
+
+augmentation:
+  default_augmentation_steps:
+    # - baseline
+    - shot_noise
+    - dark_current_noise
+    - photo_response_non_uniformity
+    # - cosmic_ray
+    
+  normalization: # normalization options
+    normalization_type_options: # by_max or by_area
+      by_area
+
+  amplification: # spectrum_amplifying_factor
+    spectrum_amplifying_factor: 
+      low: 1
+      high: 3  # Uniform
+
+  shot_noise: # photon shot noise
+    noise_type: poisson
+    lam: 
+      low: 1 # lambda for poisson noise
+      high: 20
+
+  dark_current_noise: #dark_current_shot_noise
+    noise_type: poisson
+    lam: 
+      low: 1 # lambda for poisson noise
+      high: 20
+
+  photo_response_non_uniformity: #photo_response_non_uniformity
+    noise_type: gaussian
+    mean: 
+      low: -30
+      high: 30
+    std: 
+      low: 10
+      high: 20
+
+  FPN_noise: #dark_signal_FPN_noise
+    noise_type: lognormal
+    mean: 
+      low: -10
+      high: 10
+    sigma: 
+      low: 5
+      high: 10
+
+  horizontal_shift: #instrumental_horizontal_shift
+    low: 0.5
+    high: 1.5
+    # The unit is cm-1   
+
+  convoluting_gaussian:
+    guassian_std:
+      low: 0.3 # gussian std
+      high: 0.8
+
+  cosmic_ray:
+    spike_number: 
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+    spike_number_prob: 
+      - 0.99
+      - 0.009
+      - 0.0009
+      - 0.00009
+      - 0.000005
+      - 0.000005
+    spike_amplitude: 
+      low: 2
+      high: 3
+
+  baseline: 
+    baseline_type_options: 
+      - poly
+    baseline_amplifying_factor: 
+      low: 0.1
+      high: 1.5 # Uniform
+    baseline_offset:
+      low: 300
+      high: 800
+    poly_orders: 
+      low: 1
+      high: 3
+    poly_coefficients:
+      low: 0.00000001
+      high: 0.0000001
+    # sine:
+    #   sine_amplitude: 
+    #     low: 1
+    #     high: 5
+    #   sine_frequency: 
+    #     low: 2
+    #     high: 15
+    #   sine_phase:
+    #     low: 0
+    #     high: 2
