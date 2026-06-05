@@ -5,6 +5,7 @@ This module provides a QThread wrapper for the StepperStage,
 enabling thread-safe GUI updates via Qt signals.
 """
 
+import threading
 from typing import Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker
 
@@ -168,18 +169,27 @@ class MotionThread(QThread):
         """
         Request homing of specified axes.
 
+        Dispatches to a background thread so the GUI thread is never
+        blocked by the homing sequence (including safety Z-raise).
+
         Args:
             axes: Axes to home ('X', 'Y', 'Z', 'XY', 'XYZ')
         """
         with QMutexLocker(self._mutex):
-            if self._stage and self._stage.is_connected:
-                def on_complete(success: bool):
-                    if not success:
-                        self.error.emit(f"Homing failed for {axes}")
-
-                self._stage.home(axes, callback=on_complete)
-            else:
+            if not self._stage or not self._stage.is_connected:
                 self.error.emit("Stage not connected")
+                return
+            stage = self._stage
+
+        def _do_home():
+            def on_complete(success: bool):
+                if not success:
+                    self.error.emit(f"Homing failed for {axes}")
+
+            stage.home(axes, callback=on_complete)
+
+        t = threading.Thread(target=_do_home, name=f"Home-{axes}", daemon=True)
+        t.start()
 
     def request_move_to(
         self,
@@ -229,17 +239,34 @@ class MotionThread(QThread):
             else:
                 self.error.emit("Stage not connected")
 
-    def request_go_home(self) -> None:
-        """Request movement to home position."""
-        with QMutexLocker(self._mutex):
-            if self._stage and self._stage.is_connected:
-                def on_complete(success: bool):
-                    if not success:
-                        self.error.emit("Go home failed")
+    def request_go_home(
+        self,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        z: Optional[float] = None,
+    ) -> None:
+        """Request movement to home position.
 
-                self._stage.go_to_home(callback=on_complete)
-            else:
+        Args:
+            x, y, z: Override target coordinates (physical). When provided
+                these are forwarded to ``StepperStage.go_to_home`` instead
+                of the configured home position.
+        """
+        with QMutexLocker(self._mutex):
+            if not self._stage or not self._stage.is_connected:
                 self.error.emit("Stage not connected")
+                return
+            stage = self._stage
+
+        def _do_go_home():
+            def on_complete(success: bool):
+                if not success:
+                    self.error.emit("Go home failed")
+
+            stage.go_to_home(x=x, y=y, z=z, callback=on_complete)
+
+        t = threading.Thread(target=_do_go_home, name="GoHome", daemon=True)
+        t.start()
 
     def request_stop(self) -> None:
         """Request emergency stop."""
@@ -284,3 +311,29 @@ class MotionThread(QThread):
     def move_z(self, z: float, speed: Optional[int] = None) -> None:
         """Move only Z axis to specified position."""
         self.request_move_to(z=z, speed=speed)
+
+    def move_z_blocking(self, z: float, speed: Optional[int] = None,
+                        timeout: float = 30.0) -> bool:
+        """Move Z and block until the move completes.
+
+        For use from a worker thread (e.g. autofocus) — NEVER call this on the
+        GUI thread, it would freeze the UI. The mutex is held only while the
+        command is queued; the wait happens outside it so the GUI thread is
+        not blocked.
+        """
+        done = threading.Event()
+        result = {'ok': False}
+
+        def _cb(success: bool):
+            result['ok'] = bool(success)
+            done.set()
+
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                return False
+            self._stage.move_to(z=z, speed=speed, callback=_cb)
+
+        if not done.wait(timeout):
+            logger.warning(f"move_z_blocking timed out moving to Z={z}")
+            return False
+        return result['ok']

@@ -11,10 +11,10 @@ Features:
 
 from typing import Optional, List, Tuple
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QSpinBox, QDoubleSpinBox,
     QProgressBar, QTextEdit, QComboBox, QCheckBox,
-    QFrame, QSplitter, QScrollArea
+    QRadioButton, QButtonGroup, QFrame, QSplitter, QScrollArea
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
@@ -82,6 +82,9 @@ class ProtocolPanelWidget(QWidget):
     def __init__(
         self,
         state_machine: Optional[AcquisitionStateMachine] = None,
+        stage_control=None,
+        live_view=None,
+        spectrum_viewer=None,
         parent: Optional[QWidget] = None
     ):
         super().__init__(parent)
@@ -89,22 +92,90 @@ class ProtocolPanelWidget(QWidget):
         # Create state machine if not provided
         self._state_machine = state_machine or AcquisitionStateMachine()
 
+        # Live-tab widgets whose parameters are mirrored here. Editing a mirror
+        # and pressing Start pushes the values back to keep the Live tab in sync.
+        self._stage_control = stage_control
+        self._live_view = live_view
+        self._spectrum_viewer = spectrum_viewer
+        # key -> (local spin box, callable returning the live target spin box)
+        self._bindings: dict = {}
+
         # Build UI
         self._setup_ui()
         self._connect_signals()
+
+        # Initialise the mirrors from the current Live-tab values.
+        self.pull_from_live()
+
+    # --- parameter mirroring -------------------------------------------------
+    @staticmethod
+    def _live_spin(widget, attr):
+        return getattr(widget, attr, None) if widget is not None else None
+
+    def _mirror(self, grid, row, key, label, get_target):
+        """Add a local spin box mirroring a Live-tab spin box; register a
+        binding so values can be pulled/pushed. Skips silently if the target
+        widget isn't available."""
+        target = get_target()
+        if target is None:
+            return row
+        if isinstance(target, QDoubleSpinBox):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(target.decimals())
+        else:
+            spin = QSpinBox()
+        spin.setRange(target.minimum(), target.maximum())
+        spin.setSingleStep(target.singleStep())
+        if target.suffix():
+            spin.setSuffix(target.suffix())
+        spin.setValue(target.value())
+        grid.addWidget(QLabel(label), row, 0)
+        grid.addWidget(spin, row, 1)
+        self._bindings[key] = (spin, get_target)
+        # Connect AFTER the initial setValue so setup doesn't trigger refresh.
+        spin.valueChanged.connect(self._refresh_preview)
+        return row + 1
+
+    def pull_from_live(self):
+        """Copy the current Live-tab values into the mirror fields."""
+        for spin, get_target in self._bindings.values():
+            t = get_target()
+            if t is not None:
+                spin.blockSignals(True)
+                spin.setValue(t.value())
+                spin.blockSignals(False)
+
+    def push_to_live(self):
+        """Write the mirror field values back to the Live-tab widgets."""
+        for spin, get_target in self._bindings.values():
+            t = get_target()
+            if t is not None:
+                t.setValue(spin.value())
+
+    def showEvent(self, event):
+        # Whenever the Auto Acquisition tab is shown, refresh the mirrors so
+        # they reflect whatever the user last set in the Live tab.
+        super().showEvent(event)
+        self.pull_from_live()
+        self._refresh_preview()
 
     def _setup_ui(self):
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(12)
 
-        # Left panel - Sample grid and position selection
-        left_panel = self._create_position_panel()
-        main_layout.addWidget(left_panel, 1)
+        # Left column - all parameter panels + controls
+        main_layout.addWidget(self._create_control_panel(), 3)
 
-        # Right panel - Parameters and control
-        right_panel = self._create_control_panel()
-        main_layout.addWidget(right_panel, 1)
+        # Middle column - the sample droplet map
+        main_layout.addWidget(self._create_position_panel(), 3)
+
+        # Right column - live preview of every step the parameters will generate
+        main_layout.addWidget(self._create_preview_panel(), 2)
+
+        # Reflect the initial acquisition mode (enables/disables the grid)
+        self._on_acquisition_mode_changed()
+        self._refresh_preview()
 
     def _create_position_panel(self) -> QWidget:
         """Create the position selection panel."""
@@ -113,9 +184,8 @@ class ProtocolPanelWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # Sample grid
-        self._sample_grid = SampleGridWidget()
-        self._sample_grid.set_multi_select(True)
+        # Sample grid (multi-select for acquisition)
+        self._sample_grid = SampleGridWidget(multi_select=True)
         self._sample_grid.selection_changed.connect(self._on_selection_changed)
         layout.addWidget(self._sample_grid)
 
@@ -140,24 +210,122 @@ class ProtocolPanelWidget(QWidget):
 
         return panel
 
+    # --- step preview --------------------------------------------------------
+    def _create_preview_panel(self) -> QWidget:
+        """Right column: a live, read-only list of every step the current
+        parameters + selection will generate."""
+        group = QGroupBox("Acquisition Steps Preview")
+        layout = QVBoxLayout(group)
+        self._preview_text = QTextEdit()
+        self._preview_text.setReadOnly(True)
+        self._preview_text.setStyleSheet(f'''
+            QTextEdit {{
+                background-color: {COLORS['bg_light']};
+                border: 1px solid {COLORS['border_dark']};
+                border-radius: 4px;
+                font-family: "SF Mono", "Consolas", monospace;
+                font-size: 11px;
+                color: {COLORS['text_primary']};
+            }}
+        ''')
+        layout.addWidget(self._preview_text)
+        return group
+
+    def _refresh_preview(self):
+        """Rebuild the step list from the current parameters + selection."""
+        if not hasattr(self, '_preview_text'):
+            return
+        from raman_control.gui.widgets.sample_grid import well_name
+
+        p = self.get_acquisition_parameters()
+        mode = p['acquisition_mode']
+        if mode == 'Current FoV':
+            pos_names = ["Current FoV"]
+        else:
+            pos_names = [well_name(r, c)
+                         for (r, c) in self._sample_grid.get_selected_positions()]
+
+        repeats = p['repeat_each_sample']
+        reps_per_point = p['reps_per_point']
+        averaging = p['averaging']
+        expo = self._binding_value('acq_exposure')
+        power = self._binding_value('acq_power')
+        expo_s = f"{expo} ms" if expo is not None else "exposure"
+        power_s = f"{power} mW" if power is not None else "power"
+
+        af_steps = []
+        if p['autofocus_widefield_prusa']:
+            af_steps.append("Autofocus widefield camera with Prusa")
+        if p['autofocus_wasatch_prusa']:
+            af_steps.append("Autofocus Wasatch with Prusa")
+        if p['autofocus_wasatch_nanodrive'] and not p['z_stack']:
+            af_steps.append("Autofocus Wasatch with NanoDrive")
+
+        if not pos_names:
+            self._preview_text.setPlainText(
+                "No positions selected.\n\nSelect wells in the Sample Droplet "
+                "Map (middle), or switch to Current FoV mode.")
+            return
+
+        lines = [
+            f"Mode: {mode}",
+            (f"Positions: {len(pos_names)}" if mode != 'Current FoV'
+             else "Positions: current field of view"),
+            f"Sample repeats: {repeats}",
+            "",
+        ]
+        n = 0
+        for rep in range(repeats):
+            if repeats > 1:
+                lines.append(f"=== Sample repeat {rep + 1}/{repeats} ===")
+            for name in pos_names:
+                lines.append(f"[{name}]")
+                n += 1
+                lines.append(f"  {n}. Move to {name}")
+                for af in af_steps:
+                    n += 1
+                    lines.append(f"  {n}. {af}")
+                if p['wait_before_measure']:
+                    n += 1
+                    lines.append(f"  {n}. Wait {p['wait_time_s']} s with laser on")
+                if p['z_stack']:
+                    n += 1
+                    lines.append(f"  {n}. Z-stack at point (NanoDrive range/step)")
+                for k in range(reps_per_point):
+                    n += 1
+                    lines.append(f"  {n}. Acquire spectrum {k + 1}/{reps_per_point}"
+                                 f"  ({expo_s}, {power_s}, avg {averaging})")
+                n += 1
+                lines.append(f"  {n}. Save data")
+            lines.append("")
+
+        header = f"Total steps: {n}\n" + "-" * 30 + "\n"
+        self._preview_text.setPlainText(header + "\n".join(lines))
+
     def _create_control_panel(self) -> QWidget:
-        """Create the control and parameters panel."""
-        panel = QFrame()
-        layout = QVBoxLayout(panel)
+        """Create the control and parameters panel (scrollable)."""
+        content = QFrame()
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        # State indicator
-        state_group = QGroupBox("Workflow State")
-        state_layout = QVBoxLayout(state_group)
-        self._state_indicator = StateIndicator()
-        state_layout.addWidget(self._state_indicator)
-        layout.addWidget(state_group)
+        # Acquisition mode (Current FoV vs Robotic Deposition)
+        layout.addWidget(self._create_mode_group())
 
-        # Acquisition parameters
+        # Acquisition parameters (protocol-specific: reps / repeat / averaging)
         params_group = QGroupBox("Acquisition Parameters")
-        params_layout = QGridLayout = self._create_parameters_layout(params_group)
+        self._create_parameters_layout(params_group)
         layout.addWidget(params_group)
+
+        # --- Mirrored Live-tab parameters (editable; pushed back on Start) ---
+        layout.addWidget(self._create_spectrum_acq_group())
+        layout.addWidget(self._create_af_range_group())
+        layout.addWidget(self._create_camera_af_group())
+        layout.addWidget(self._create_spec_af_group())
+        layout.addWidget(self._create_pattern_group())
+
+        # Acquisition options (autofocus toggles, Z-stack, wait)
+        layout.addWidget(self._create_options_group())
 
         # Control buttons
         control_group = QGroupBox("Control")
@@ -274,7 +442,180 @@ class ProtocolPanelWidget(QWidget):
 
         layout.addStretch()
 
-        return panel
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        return scroll
+
+    # --- mirrored Live-tab parameter groups ---------------------------------
+    def _create_spectrum_acq_group(self) -> QGroupBox:
+        """Spectrum acquisition exposure / laser power (NOT the autofocus ones)."""
+        group = QGroupBox("Spectrum Acquisition (Exposure & Power)")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        r = 0
+        sv = self._spectrum_viewer
+        r = self._mirror(grid, r, 'acq_exposure', "Exposure Time:",
+                         lambda: self._live_spin(sv, '_integration_spin'))
+        r = self._mirror(grid, r, 'acq_power', "Laser Power:",
+                         lambda: self._live_spin(sv, '_power_spin'))
+        return group
+
+    def _create_af_range_group(self) -> QGroupBox:
+        """Autofocus Z ranges (widefield / objective / nanodrive)."""
+        group = QGroupBox("Autofocus Range")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        r = 0
+        sc = self._stage_control
+        for key, label, attr in [
+            ('wf_z_upper', "Widefield Z Upper:", '_wf_z_upper'),
+            ('wf_z_lower', "Widefield Z Lower:", '_wf_z_lower'),
+            ('obj_z_upper', "Objective Z Upper:", '_obj_z_upper'),
+            ('obj_z_lower', "Objective Z Lower:", '_obj_z_lower'),
+            ('nano_upper', "NanoDrive Upper:", '_nano_upper'),
+            ('nano_lower', "NanoDrive Lower:", '_nano_lower'),
+        ]:
+            r = self._mirror(grid, r, key, label,
+                             lambda a=attr: self._live_spin(sc, a))
+        return group
+
+    def _create_camera_af_group(self) -> QGroupBox:
+        """Camera (widefield) autofocus step count."""
+        group = QGroupBox("Camera Autofocus")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        lv = self._live_view
+        self._mirror(grid, 0, 'cam_af_steps', "Camera AF Steps:",
+                     lambda: self._live_spin(lv, '_af_steps_spin'))
+        return group
+
+    def _create_spec_af_group(self) -> QGroupBox:
+        """Spectrometer autofocus parameters (own exposure/power, steps, reps)."""
+        group = QGroupBox("Spectrometer Autofocus")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        r = 0
+        sv = self._spectrum_viewer
+        for key, label, attr in [
+            ('spec_af_coarse', "Prusa Coarse Steps:", '_af_prusa_steps'),
+            ('spec_af_fine', "NanoDrive Fine Steps:", '_af_nano_steps'),
+            ('spec_af_exposure', "AF Exposure:", '_af_expo'),
+            ('spec_af_power', "AF Laser Power:", '_af_power'),
+            ('spec_af_reps', "AF Reps:", '_af_reps'),
+        ]:
+            r = self._mirror(grid, r, key, label,
+                             lambda a=attr: self._live_spin(sv, a))
+        return group
+
+    def _create_pattern_group(self) -> QGroupBox:
+        """Sample-point pattern parameters (grid / ring / line / random)."""
+        group = QGroupBox("Sample Pattern")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        r = 0
+        lv = self._live_view
+        for key, label, attr in [
+            ('grid_rows', "Grid Rows:", '_grid_rows'),
+            ('grid_cols', "Grid Cols:", '_grid_cols'),
+            ('grid_buffer', "Grid Buffer:", '_grid_buffer'),
+            ('ring_rays', "Ring Rays:", '_ring_rays'),
+            ('ring_rings', "Ring Rings:", '_ring_rings'),
+            ('ring_interval', "Ring Interval:", '_ring_interval'),
+            ('ring_buffer', "Ring Buffer:", '_ring_buffer'),
+            ('line_points', "Line Points:", '_line_points'),
+            ('line_buffer', "Line Buffer:", '_line_buffer'),
+            ('rand_points', "Random Points:", '_rand_points'),
+        ]:
+            r = self._mirror(grid, r, key, label,
+                             lambda a=attr: self._live_spin(lv, a))
+        return group
+
+    def _create_mode_group(self) -> QGroupBox:
+        """Acquisition mode: Current FoV vs Robotic Deposition (sample drops)."""
+        group = QGroupBox("Acquisition Mode")
+        lay = QHBoxLayout(group)
+        self._mode_group = QButtonGroup(self)
+        self._mode_current_fov = QRadioButton("Current FoV")
+        self._mode_robotic = QRadioButton("Robotic Deposition")
+        self._mode_robotic.setChecked(True)
+        self._mode_group.addButton(self._mode_current_fov)
+        self._mode_group.addButton(self._mode_robotic)
+        self._mode_current_fov.toggled.connect(self._on_acquisition_mode_changed)
+        lay.addWidget(self._mode_current_fov)
+        lay.addWidget(self._mode_robotic)
+        lay.addStretch()
+        return group
+
+    def _create_options_group(self) -> QGroupBox:
+        """Acquisition options: per-channel autofocus, Z-stack, wait-before-measure."""
+        group = QGroupBox("Acquisition Options")
+        lay = QVBoxLayout(group)
+        lay.setSpacing(6)
+
+        self._af_widefield_prusa = QCheckBox("Autofocus Widefield Camera with Prusa")
+        self._af_widefield_prusa.setChecked(True)
+        self._af_wasatch_prusa = QCheckBox("Autofocus Wasatch with Prusa")
+        self._af_wasatch_prusa.setChecked(True)
+        self._af_wasatch_nanodrive = QCheckBox("Autofocus Wasatch with NanoDrive")
+        self._af_wasatch_nanodrive.setChecked(True)
+        lay.addWidget(self._af_widefield_prusa)
+        lay.addWidget(self._af_wasatch_prusa)
+        lay.addWidget(self._af_wasatch_nanodrive)
+        for cb in (self._af_widefield_prusa, self._af_wasatch_prusa,
+                   self._af_wasatch_nanodrive):
+            cb.toggled.connect(self._refresh_preview)
+
+        # Z-stack: when on, the NanoDrive autofocus is redundant -> off + disabled
+        self._z_stack_check = QCheckBox(
+            "Z Stack at Each Point (uses Wasatch NanoDrive range/step)")
+        self._z_stack_check.toggled.connect(self._on_z_stack_toggled)
+        lay.addWidget(self._z_stack_check)
+
+        # Optional wait (laser on, no spectra saved) before measuring at each point
+        self._wait_check = QCheckBox("Wait with laser on before measuring")
+        self._wait_check.toggled.connect(self._on_wait_toggled)
+        lay.addWidget(self._wait_check)
+
+        wait_row = QHBoxLayout()
+        self._wait_time_label = QLabel("Wait time [s]:")
+        wait_row.addWidget(self._wait_time_label)
+        self._wait_time_spin = QSpinBox()
+        self._wait_time_spin.setRange(0, 3600)
+        self._wait_time_spin.setValue(5)
+        self._wait_time_spin.valueChanged.connect(self._refresh_preview)
+        wait_row.addWidget(self._wait_time_spin)
+        wait_row.addStretch()
+        lay.addLayout(wait_row)
+
+        # Reflect initial states
+        self._on_z_stack_toggled()
+        self._on_wait_toggled()
+        return group
+
+    def _on_acquisition_mode_changed(self):
+        """Sample-drop selection only applies to Robotic Deposition; for
+        Current FoV the measurement happens at the live camera position."""
+        robotic = self._mode_robotic.isChecked()
+        self._sample_grid.set_grid_enabled(robotic)
+        self._refresh_preview()
+
+    def _on_z_stack_toggled(self):
+        """When Z-stack is enabled the NanoDrive autofocus is redundant."""
+        if self._z_stack_check.isChecked():
+            self._af_wasatch_nanodrive.setChecked(False)
+            self._af_wasatch_nanodrive.setEnabled(False)
+        else:
+            self._af_wasatch_nanodrive.setEnabled(True)
+        self._refresh_preview()
+
+    def _on_wait_toggled(self):
+        """The wait-time entry only matters when the wait step is enabled."""
+        on = self._wait_check.isChecked()
+        self._wait_time_label.setEnabled(on)
+        self._wait_time_spin.setEnabled(on)
+        self._refresh_preview()
 
     def _create_parameters_layout(self, parent: QGroupBox):
         """Create the parameters form layout."""
@@ -285,22 +626,20 @@ class ProtocolPanelWidget(QWidget):
 
         row = 0
 
-        # Integration time
-        layout.addWidget(QLabel("Integration Time:"), row, 0)
-        self._integration_spin = QSpinBox()
-        self._integration_spin.setRange(1, 10000)
-        self._integration_spin.setValue(100)
-        self._integration_spin.setSuffix(" ms")
-        layout.addWidget(self._integration_spin, row, 1)
+        # Repetitions per point per sample drop
+        layout.addWidget(QLabel("Repetitions per point:"), row, 0)
+        self._reps_per_point_spin = QSpinBox()
+        self._reps_per_point_spin.setRange(1, 1000)
+        self._reps_per_point_spin.setValue(3)
+        layout.addWidget(self._reps_per_point_spin, row, 1)
         row += 1
 
-        # Laser power (in mW)
-        layout.addWidget(QLabel("Laser Power:"), row, 0)
-        self._power_spin = QSpinBox()
-        self._power_spin.setRange(0, 500)
-        self._power_spin.setValue(100)
-        self._power_spin.setSuffix(" mW")
-        layout.addWidget(self._power_spin, row, 1)
+        # Number of times to repeat each whole sample
+        layout.addWidget(QLabel("Repeat each sample:"), row, 0)
+        self._repeat_sample_spin = QSpinBox()
+        self._repeat_sample_spin.setRange(1, 1000)
+        self._repeat_sample_spin.setValue(1)
+        layout.addWidget(self._repeat_sample_spin, row, 1)
         row += 1
 
         # Averaging
@@ -312,37 +651,9 @@ class ProtocolPanelWidget(QWidget):
         layout.addWidget(self._averaging_spin, row, 1)
         row += 1
 
-        # Autofocus
-        layout.addWidget(QLabel("Autofocus:"), row, 0)
-        self._autofocus_check = QCheckBox("Enable")
-        self._autofocus_check.setChecked(True)
-        layout.addWidget(self._autofocus_check, row, 1)
-        row += 1
-
-        # Autofocus Z limits
-        layout.addWidget(QLabel("AF Z Upper:"), row, 0)
-        self._af_z_upper = QDoubleSpinBox()
-        self._af_z_upper.setRange(0, 100)
-        self._af_z_upper.setValue(40.0)
-        self._af_z_upper.setSuffix(" mm")
-        self._af_z_upper.setDecimals(1)
-        layout.addWidget(self._af_z_upper, row, 1)
-        row += 1
-
-        layout.addWidget(QLabel("AF Z Lower:"), row, 0)
-        self._af_z_lower = QDoubleSpinBox()
-        self._af_z_lower.setRange(0, 100)
-        self._af_z_lower.setValue(30.0)
-        self._af_z_lower.setSuffix(" mm")
-        self._af_z_lower.setDecimals(1)
-        layout.addWidget(self._af_z_lower, row, 1)
-        row += 1
-
-        # Autofocus method
-        layout.addWidget(QLabel("Focus Method:"), row, 0)
-        self._focus_method_combo = QComboBox()
-        self._focus_method_combo.addItems(["Spectrometer (Fast)", "Camera (Precise)", "Combined"])
-        layout.addWidget(self._focus_method_combo, row, 1)
+        for s in (self._reps_per_point_spin, self._repeat_sample_spin,
+                  self._averaging_spin):
+            s.valueChanged.connect(self._refresh_preview)
 
         return layout
 
@@ -355,8 +666,7 @@ class ProtocolPanelWidget(QWidget):
 
     def _on_state_changed(self, old_state: str, new_state: str):
         """Handle state machine state change."""
-        self._state_indicator.set_state(new_state)
-        self._log(f"State: {old_state} → {new_state}")
+        self._log(f"State: {old_state} -> {new_state}")
 
         # Update button states
         is_idle_or_ready = new_state in ('idle', 'ready', 'connected')
@@ -397,11 +707,17 @@ class ProtocolPanelWidget(QWidget):
         count = len(positions)
         self._selection_label.setText(f"{count} position{'s' if count != 1 else ''} selected")
         self._state_machine.set_positions(positions)
+        self._refresh_preview()
 
     def _on_start_clicked(self):
         """Handle start button click."""
+        # Push the mirrored parameters back to the Live tab first, so both tabs
+        # stay consistent for the run.
+        self.push_to_live()
+        self._log("Parameters synced to Live tab")
+
         positions = self._sample_grid.get_selected_positions()
-        if not positions:
+        if self._mode_robotic.isChecked() and not positions:
             self._log("No positions selected", error=True)
             return
 
@@ -460,19 +776,32 @@ class ProtocolPanelWidget(QWidget):
         scrollbar = self._log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _binding_value(self, key):
+        """Current value of a mirrored parameter (or None if not available)."""
+        b = self._bindings.get(key)
+        return b[0].value() if b else None
+
     def get_acquisition_parameters(self) -> dict:
-        """Get current acquisition parameters."""
-        return {
-            'integration_time_ms': self._integration_spin.value(),
-            'laser_power_mw': self._power_spin.value(),
+        """Get current acquisition parameters (protocol-specific + mirrored)."""
+        params = {
+            'acquisition_mode': ('Current FoV' if self._mode_current_fov.isChecked()
+                                 else 'Robotic Deposition'),
+            'reps_per_point': self._reps_per_point_spin.value(),
+            'repeat_each_sample': self._repeat_sample_spin.value(),
             'averaging': self._averaging_spin.value(),
-            'autofocus_enabled': self._autofocus_check.isChecked(),
-            'autofocus_z_upper': self._af_z_upper.value(),
-            'autofocus_z_lower': self._af_z_lower.value(),
-            'focus_method': self._focus_method_combo.currentText(),
+            'autofocus_widefield_prusa': self._af_widefield_prusa.isChecked(),
+            'autofocus_wasatch_prusa': self._af_wasatch_prusa.isChecked(),
+            'autofocus_wasatch_nanodrive': self._af_wasatch_nanodrive.isChecked(),
+            'z_stack': self._z_stack_check.isChecked(),
+            'wait_before_measure': self._wait_check.isChecked(),
+            'wait_time_s': self._wait_time_spin.value(),
             'save_path': self._save_path_edit.text(),
             'filename_template': self._filename_edit.text(),
         }
+        # Mirrored Live-tab parameters
+        for key in self._bindings:
+            params[key] = self._binding_value(key)
+        return params
 
     def set_state_machine(self, state_machine: AcquisitionStateMachine):
         """Set or update the state machine."""

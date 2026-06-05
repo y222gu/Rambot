@@ -112,6 +112,48 @@ class EdgeDetectorSAM():
         return pil_image
         
 
+    def _compute_buffered_mask(self, mask, buffer):
+        """Return a boolean mask of the region where sampling points are allowed.
+
+        `buffer` is in pixels and measures how far the outermost points sit from
+        the detected sample edge:
+          buffer > 0  -> points kept at least `buffer` px inside the edge
+          buffer == 0 -> points kept inside the mask (original behavior)
+          buffer < 0  -> points may spill up to `|buffer|` px outside the edge
+        """
+        mask = (mask > 0).astype(np.uint8)
+        if buffer == 0:
+            return mask.astype(bool)
+        # Signed distance from the edge: positive inside the mask, negative outside.
+        dist_inside = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        dist_outside = cv2.distanceTransform(1 - mask, cv2.DIST_L2, 5)
+        signed_dist = dist_inside - dist_outside
+        return signed_dist >= buffer
+
+    @staticmethod
+    def _resample_closed_contour(pts, n):
+        """Resample a closed contour into `n` points spaced equally by arc length.
+
+        `pts` is an (N, 2) array of (x, y) contour vertices; the loop is treated as
+        closed (last vertex connects back to the first). Returns an (n, 2) array.
+        """
+        if n <= 0 or len(pts) == 0:
+            return np.empty((0, 2))
+        if len(pts) == 1:
+            return np.repeat(pts, n, axis=0)
+        # Close the loop and measure cumulative arc length along the polygon
+        closed = np.vstack([pts, pts[:1]])
+        seg_lengths = np.sqrt(np.sum(np.diff(closed, axis=0) ** 2, axis=1))
+        cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+        total_length = cumulative[-1]
+        if total_length == 0:
+            return np.repeat(pts[:1], n, axis=0)
+        # Equally spaced targets around the perimeter, then interpolate x and y
+        targets = np.linspace(0, total_length, n, endpoint=False)
+        rx = np.interp(targets, cumulative, closed[:, 0])
+        ry = np.interp(targets, cumulative, closed[:, 1])
+        return np.stack([rx, ry], axis=1)
+
     def generate_sampling_points(self, shape, **kwargs):
         coordinates_order = None
 
@@ -121,7 +163,12 @@ class EdgeDetectorSAM():
         mask = mask.astype(np.uint8)
         mask = cv2.resize(mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
 
-        sampling_y, sampling_x = np.where(mask == 1)
+        # Buffer distance (px) of the outermost points from the detected edge.
+        # Fall back to the legacy 'offset_from_the_edge' keyword if 'buffer' is absent.
+        buffer = kwargs.get('buffer', kwargs.get('offset_from_the_edge', 0))
+        allowed = self._compute_buffered_mask(mask, buffer)
+
+        sampling_y, sampling_x = np.where(allowed)
 
         if shape == 'grid':
             row_number, col_number = kwargs['row_number'], kwargs['col_number']
@@ -132,10 +179,10 @@ class EdgeDetectorSAM():
             sampling_x, sampling_y = np.meshgrid(sampling_x, sampling_y)
             sampling_x, sampling_y = sampling_x.flatten(), sampling_y.flatten()
 
-            # --- NEW: keep only points inside the mask ---
+            # --- keep only points inside the buffered (allowed) region ---
             ix = np.clip(np.round(sampling_x).astype(int), 0, self.width - 1)
             iy = np.clip(np.round(sampling_y).astype(int), 0, self.height - 1)
-            inside = mask[iy, ix] == 1
+            inside = allowed[iy, ix]
 
             sampling_x = sampling_x[inside]
             sampling_y = sampling_y[inside]
@@ -163,22 +210,22 @@ class EdgeDetectorSAM():
         elif shape == 'line':
             num_points = kwargs['num_points']
 
-            # ensure mask has positive pixels
-            if not mask.any():
+            # ensure the allowed region has positive pixels
+            if not allowed.any():
                 sampling_x, sampling_y = np.array([]), np.array([])
             else:
-                h_img, w_img = mask.shape
-                # centroid of mask pixels
-                ys, xs = np.where(mask == 1)
+                h_img, w_img = allowed.shape
+                # centroid of allowed pixels
+                ys, xs = np.where(allowed)
                 cx = int(np.round(xs.mean()))
                 cy = int(np.round(ys.mean()))
 
-                # search outward from centroid for a row with mask pixels
+                # search outward from centroid for a row with allowed pixels
                 found_row = None
                 for offset in range(h_img):
                     for r in (cy + offset, cy - offset) if offset else (cy,):
                         if 0 <= r < h_img:
-                            cols = np.where(mask[r] == 1)[0]
+                            cols = np.where(allowed[r])[0]
                             if cols.size:
                                 # pick the largest contiguous segment in this row
                                 diffs = np.diff(cols)
@@ -205,97 +252,59 @@ class EdgeDetectorSAM():
                     sampling_y = np.full_like(sampling_x, float(self.center_y))
 
         elif shape == 'rings':
-            # Radial lines with points distributed from near-center to edge
-            num_rays = kwargs.get('num_rays', kwargs.get('num_points', 50))  # Number of radial lines
-            num_rings = kwargs['num_rings']  # Points along each ray
-            interval = kwargs['interval']  # Pixel interval between rings
-            offset_from_the_edge = kwargs['offset_from_the_edge']  # Offset from edge in pixels
-            
-            # Find mask center and edge distances
-            ys, xs = np.where(mask == 1)
-            if len(ys) == 0:
+            # True concentric contours: points sit on iso-distance contours at fixed
+            # depths from the detected edge and are sampled at equal arc length, so the
+            # spacing stays even and consistent even for irregular / concave samples.
+            num_points_per_contour = kwargs.get('num_rays', kwargs.get('num_points', 50))  # points per contour
+            num_contours = kwargs['num_rings']  # number of concentric contours
+            interval = kwargs['interval']       # depth spacing between contours (px)
+            # `buffer` is the depth of the OUTERMOST contour from the edge (negative spills out)
+
+            if not mask.any():
                 sampling_x, sampling_y = np.array([]), np.array([])
                 ring_numbers = np.array([])
                 line_numbers = np.array([])
             else:
-                center_x = xs.mean()
-                center_y = ys.mean()
-                
+                # Signed distance field: positive inside the mask, negative outside.
+                m = (mask > 0).astype(np.uint8)
+                dist_inside = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+                dist_outside = cv2.distanceTransform(1 - m, cv2.DIST_L2, 5)
+                signed_dist = dist_inside - dist_outside
+
                 sampling_x, sampling_y = [], []
                 ring_numbers, line_numbers = [], []
-                
-                # Generate rays at equal angular intervals
-                angles = np.linspace(0, 2*np.pi, num_rays, endpoint=False)
-                
-                for ray_idx, angle in enumerate(angles):
-                    # Direction vector for this ray
-                    dx = np.cos(angle)
-                    dy = np.sin(angle)
-                    
-                    # Find intersection of ray with mask boundary
-                    max_dist = max(self.width, self.height)
-                    edge_dist = 0
-                    
-                    for dist in range(int(max_dist)):
-                        x = int(center_x + dist * dx)
-                        y = int(center_y + dist * dy)
-                        
-                        # Check if we've left the mask
-                        if x < 0 or x >= self.width or y < 0 or y >= self.height or mask[y, x] == 0:
-                            edge_dist = dist - 1
-                            break
-                    
-                    # Calculate positions for points along this ray
-                    if edge_dist > 0:
-                        # Start from offset_from_the_edge pixels from the edge
-                        # and place points at interval pixels apart going inward
-                        start_dist = edge_dist - offset_from_the_edge
-                        
-                        # Minimum distance from center to avoid overlap (e.g., 5-10 pixels)
-                        min_dist_from_center = 10
-                        
-                        # Generate point positions
-                        point_distances = []
-                        for i in range(num_rings):
-                            dist = start_dist - i * interval
-                            if dist > min_dist_from_center:
-                                point_distances.append(dist)
-                        
-                        # Add points along this ray
-                        for ring_idx, d in enumerate(point_distances):
-                            px = center_x + d * dx
-                            py = center_y + d * dy
-                            # Only add if inside mask
-                            if 0 <= int(px) < self.width and 0 <= int(py) < self.height:
-                                if mask[int(py), int(px)] > 0:
-                                    sampling_x.append(px)
-                                    sampling_y.append(py)
-                                    ring_numbers.append(ring_idx + 1)
-                                    line_numbers.append(ray_idx + 1)
-                
+
+                for contour_idx in range(int(num_contours)):
+                    # Depth of this contour from the edge (outermost first, going inward)
+                    level = buffer + contour_idx * interval
+                    # The boundary of the "at least `level` deep" region is the iso-contour
+                    region = (signed_dist >= level).astype(np.uint8)
+                    contours, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                    # Keep contours with a meaningful perimeter (a shape can split into
+                    # several pieces at a given depth, e.g. concave / annular samples)
+                    contours = [c for c in contours if len(c) >= 2 and cv2.arcLength(c, True) > 1]
+                    if not contours:
+                        continue
+                    perimeters = np.array([cv2.arcLength(c, True) for c in contours])
+                    total_perimeter = perimeters.sum()
+
+                    line_counter = 0
+                    for c, perimeter in zip(contours, perimeters):
+                        # distribute the points across pieces proportional to their perimeter
+                        n_pts = max(1, int(round(num_points_per_contour * perimeter / total_perimeter)))
+                        resampled = self._resample_closed_contour(c.reshape(-1, 2).astype(float), n_pts)
+                        for rx, ry in resampled:
+                            sampling_x.append(float(rx))
+                            sampling_y.append(float(ry))
+                            ring_numbers.append(contour_idx + 1)
+                            line_counter += 1
+                            line_numbers.append(line_counter)
+
                 sampling_x = np.array(sampling_x)
                 sampling_y = np.array(sampling_y)
                 ring_numbers = np.array(ring_numbers)
                 line_numbers = np.array(line_numbers)
 
-                # Compute angles and sort
-                point_angles = np.arctan2(sampling_y - center_y, sampling_x - center_x)
-                sorted_indices = np.argsort(point_angles)
-
-                # Sort all arrays by angle
-                sampling_x = sampling_x[sorted_indices]
-                sampling_y = sampling_y[sorted_indices]
-                ring_numbers = ring_numbers[sorted_indices]
-                line_numbers = line_numbers[sorted_indices]
-
-                # Rotate arrays so the sequence starts from a chosen reference point
-                # (keep the original radial numbers so all points on the same ray keep the same id)
-                min_y_index = np.argmin(sampling_y)
-                sampling_x = np.roll(sampling_x, -min_y_index)
-                sampling_y = np.roll(sampling_y, -min_y_index)
-                ring_numbers = np.roll(ring_numbers, -min_y_index)
-                line_numbers = np.roll(line_numbers, -min_y_index)
-                
                 coordinates_order = [{'ring': int(r), 'line': int(l)} for r, l in zip(ring_numbers, line_numbers)]
 
         px = 1/plt.rcParams['figure.dpi']  # pixel in inches

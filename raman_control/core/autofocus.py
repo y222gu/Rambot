@@ -282,8 +282,61 @@ class AutofocusEngine(QObject):
         return np.sqrt(gx**2 + gy**2).mean()
 
     @staticmethod
+    def calculate_tenengrad(image: np.ndarray) -> float:
+        """Tenengrad focus score (noodlepy camera metric).
+
+        Sum of squared Sobel gradients after a 3px median blur. Higher =
+        sharper, so camera autofocus maximises it.
+        """
+        import cv2
+        if image is None:
+            return 0.0
+        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 3)
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        return float(np.sum(gx * gx + gy * gy))
+
+    @staticmethod
     def calculate_intensity(spectrum: np.ndarray) -> float:
         """Calculate peak intensity from spectrum."""
         if spectrum is None or len(spectrum) == 0:
             return 0.0
         return np.max(spectrum)
+
+    # --- Spectrometer focus metrics (noodlepy, wavelength/nm windows) ---
+    # Lower score = better focus (the autofocus scan minimises these).
+
+    @staticmethod
+    def calculate_ratio_score(wavelength_nm: np.ndarray,
+                              intensity: np.ndarray) -> float:
+        """Ratio of the 808–815 nm band to the 790–795 nm band.
+
+        Matches noodlepy: numerator = quartz peak (808–815 nm), denominator =
+        reflected laser (790–795 nm). Minimised during autofocus.
+        """
+        if wavelength_nm is None or intensity is None:
+            return float('inf')
+        wl = np.asarray(wavelength_nm)
+        inten = np.asarray(intensity, dtype=float)
+        reflected = inten[(wl >= 790) & (wl <= 795)]   # reflected laser
+        peak = inten[(wl >= 808) & (wl <= 815)]        # quartz peak
+        denom = float(np.sum(reflected))
+        if denom == 0:
+            return float('inf')
+        return float(np.sum(peak) / denom)
+
+    @staticmethod
+    def calculate_entropy(wavelength_nm: np.ndarray,
+                          intensity: np.ndarray) -> float:
+        """Shannon entropy of the 830–920 nm band (noodlepy). Minimised."""
+        if wavelength_nm is None or intensity is None:
+            return float('inf')
+        wl = np.asarray(wavelength_nm)
+        inten = np.asarray(intensity, dtype=float)
+        crop = inten[(wl >= 830) & (wl <= 920)]
+        total = float(np.sum(crop))
+        if total <= 0:
+            return float('inf')
+        p = crop / total
+        return float(-np.sum(p * np.log2(p + 1e-12)))

@@ -158,7 +158,7 @@ class AcquisitionStateMachine(QObject):
         """Called after every state transition."""
         old_state = event.transition.source
         new_state = event.transition.dest
-        logger.info(f"State transition: {old_state} → {new_state}")
+        logger.info(f"State transition: {old_state} -> {new_state}")
         self.state_changed.emit(old_state, new_state)
 
     def set_positions(self, positions: List[tuple]):

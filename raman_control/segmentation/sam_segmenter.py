@@ -13,7 +13,15 @@ from raman_control.config.logging_config import get_logger
 logger = get_logger('sam_segmenter')
 
 # Model checkpoint path
-MODEL_PATH = Path(__file__).parent / "sam_vit_b_01ec64.pth"
+MODELS_DIR = Path(__file__).parent / "models"
+MODEL_PATH = MODELS_DIR / "sam_vit_b_01ec64.pth"
+
+# Map filename patterns to SAM model types
+_SAM_MODEL_TYPES = {
+    'vit_h': 'vit_h',
+    'vit_l': 'vit_l',
+    'vit_b': 'vit_b',
+}
 
 
 class SAMSegmenter:
@@ -40,16 +48,16 @@ class SAMSegmenter:
         centroids = segmenter.get_mask_centroids(masks)
     """
 
-    def __init__(self, model_path: Optional[str] = None, device: str = 'cpu'):
+    def __init__(self, model_path: Optional[str] = None, device: Optional[str] = None):
         """
         Initialize SAM segmenter.
 
         Args:
             model_path: Path to SAM checkpoint. Uses default if None.
-            device: 'cpu' or 'cuda'
+            device: 'cpu' or 'cuda'. Auto-detects if None.
         """
         self._model_path = Path(model_path) if model_path else MODEL_PATH
-        self._device = device
+        self._device = device  # resolved in load_model
         self._model = None
         self._predictor = None
         self._mask_generator = None
@@ -62,7 +70,11 @@ class SAMSegmenter:
     def load_model(self) -> bool:
         """Load the SAM model."""
         try:
+            import torch
             from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+
+            if self._device is None:
+                self._device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
             if not self._model_path.exists():
                 logger.error(f"SAM model not found at {self._model_path}")
@@ -70,8 +82,16 @@ class SAMSegmenter:
 
             logger.info(f"Loading SAM model from {self._model_path}")
 
+            # Detect model type from filename
+            model_type = 'vit_b'  # default
+            fname = self._model_path.stem.lower()
+            for key, mtype in _SAM_MODEL_TYPES.items():
+                if key in fname:
+                    model_type = mtype
+                    break
+
             # Load model
-            self._model = sam_model_registry["vit_b"](checkpoint=str(self._model_path))
+            self._model = sam_model_registry[model_type](checkpoint=str(self._model_path))
             self._model.to(self._device)
 
             # Create predictor and mask generator
@@ -154,6 +174,10 @@ class SAMSegmenter:
             return np.zeros(image.shape[:2], dtype=np.uint8)
 
         try:
+            # SAM requires 3-channel RGB input
+            if image.ndim == 2:
+                image = np.stack([image] * 3, axis=-1)
+
             self._predictor.set_image(image)
 
             masks, scores, logits = self._predictor.predict(

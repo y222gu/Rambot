@@ -78,6 +78,7 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         self.sample_drop_panel_total_width = len(self.sample_drop_panel_grid_pattern) * self.sample_drop_panel_spacing
         self.sample_drop_panel_total_height = self.sample_drop_panel_max_rows * self.sample_drop_panel_spacing
         self.sample_drop_panel_current_sample_row_column = None
+        self.sample_drop_panel_circles_disabled = False
         self.sample_drop_panel_circle_pursa_coordinates_in_widefield = {}  # Store physical coordinates of circles
         self.sample_drop_panel_circle_pursa_coordinates_in_objective = {}  # Store physical coordinates of circles in objective view
         self.sample_drop_panel_calculate_circle_pursa_coordinates()
@@ -271,18 +272,33 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         register_camera_focus_range_frame = ttk.Frame(quartz_slides_and_sample_drops_frame, padding=5)
         register_camera_focus_range_frame.grid(row=0, column=1, rowspan=5, columnspan=4, sticky='nsew', padx=5, pady=5)
 
-        ttk.Label(register_camera_focus_range_frame, text="Upper Z Limit [mm]:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.upper_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=3)
+        # Widefield focus range entries (editable in widefield view)
+        ttk.Label(register_camera_focus_range_frame, text="WF Upper Z [mm]:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.upper_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=5)
         self.upper_limit_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.upper_limit_label = ttk.Label(register_camera_focus_range_frame, text="N/A", foreground="grey")
 
-        ttk.Label(register_camera_focus_range_frame, text="Lower Z Limit [mm]:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.lower_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=3)
+        ttk.Label(register_camera_focus_range_frame, text="WF Lower Z [mm]:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.lower_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=5)
         self.lower_limit_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.lower_limit_label = ttk.Label(register_camera_focus_range_frame, text="N/A", foreground="grey")
 
         ttk.Label(register_camera_focus_range_frame, text="Widefield # of Steps:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
-        self.widefield_focus_steps_entry = ttk.Entry(register_camera_focus_range_frame, width=3)
+        self.widefield_focus_steps_entry = ttk.Entry(register_camera_focus_range_frame, width=5)
         self.widefield_focus_steps_entry.grid(row=2, column=1, padx=5, pady=5)
-        self.widefield_focus_steps_entry.insert(0, 20)
+        self.widefield_focus_steps_entry.insert(0, 5)
+        self.widefield_focus_steps_label = ttk.Label(register_camera_focus_range_frame, text="5", foreground="grey")
+
+        # Objective focus range (label by default, entry when in objective view)
+        ttk.Label(register_camera_focus_range_frame, text="Obj Upper Z [mm]:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        self.obj_upper_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=5)
+        self.obj_upper_limit_label = ttk.Label(register_camera_focus_range_frame, text="N/A", foreground="grey")
+        self.obj_upper_limit_label.grid(row=3, column=1, padx=5, pady=5)
+
+        ttk.Label(register_camera_focus_range_frame, text="Obj Lower Z [mm]:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        self.obj_lower_limit_entry = ttk.Entry(register_camera_focus_range_frame, width=5)
+        self.obj_lower_limit_label = ttk.Label(register_camera_focus_range_frame, text="N/A", foreground="grey")
+        self.obj_lower_limit_label.grid(row=4, column=1, padx=5, pady=5)
 
         self.register_widefield_focus_range_button = ttk.Button(register_camera_focus_range_frame, text="Register", command=self.register_prusa_focus_range, bootstyle="info-outline", state= DISABLED)
         self.register_widefield_focus_range_button.grid(row=0, column=2, rowspan=2, padx=5, pady=5, sticky='news')
@@ -293,17 +309,6 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         self.objective_focus_z_label.grid(row=3, column=2,  padx=5, pady=5, sticky="nsew")
         self.objective_focus_ND_z_label = ttk.Label(register_camera_focus_range_frame, text="Obj f ND Z[um]: N/A", foreground="grey", anchor="center")
         self.objective_focus_ND_z_label.grid(row=4, column=2, padx=5, pady=5, sticky="nsew")
-
-        # quartz slide navigation section
-        quartz_slide_navigation_frame = ttk.Frame(quartz_slides_and_sample_drops_frame, padding=5)
-        quartz_slide_navigation_frame.grid(row=5, column=0, columnspan=5, sticky='nsew', padx=5, pady=5)
-        self.previous_quartz_slide_button = ttk.Button(quartz_slide_navigation_frame, text="Previous Slide", command=self.move_to_previous_quartz_slide, bootstyle="info", state=DISABLED)
-        self.previous_quartz_slide_button.grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.quartz_slide_label = ttk.Label(quartz_slide_navigation_frame, text="Quartz Slide: 1")
-        self.quartz_slide_label.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.next_quartz_slide_button = ttk.Button(quartz_slide_navigation_frame, text="Next Quartz Slide", command=self.move_to_next_quartz_slide, bootstyle="info", state=DISABLED)
-        self.next_quartz_slide_button.grid(row=0, column=2, padx=5, pady=5, sticky="e")
-
 
     def run_in_thread(self, func, *args):
         thread = Thread(target=func, args=args, daemon=True)
@@ -458,8 +463,6 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
             self.calibrate_home_position_button.configure(state=NORMAL)
             self.sample_drop_panel_canvas.configure(state=NORMAL)
             self.sample_drop_panel_activate_circles()
-            self.previous_quartz_slide_button.configure(state=NORMAL)
-            self.next_quartz_slide_button.configure(state=NORMAL)
             self.sample_drop_panel_tooltip.configure(state=NORMAL)
             self.go_button.configure(state=NORMAL)
             self.update_position_button.configure(state=NORMAL)
@@ -601,12 +604,41 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
             print("Switching to objective view")
             self.prusa_go_by_xyz(x=self.calibration_from_widefield_to_objective_x, y=self.calibration_from_widefield_to_objective_y)
             self.prusa_go_by_xyz(z=self.calibration_from_widefield_to_objective_z)
+            self.sample_drop_panel_disable_circles()
+            # Swap widefield entries to labels, objective labels to entries
+            self.upper_limit_label.config(text=self.upper_limit_entry.get() or "N/A")
+            self.upper_limit_entry.grid_remove()
+            self.upper_limit_label.grid(row=0, column=1, padx=5, pady=5)
+            self.lower_limit_label.config(text=self.lower_limit_entry.get() or "N/A")
+            self.lower_limit_entry.grid_remove()
+            self.lower_limit_label.grid(row=1, column=1, padx=5, pady=5)
+            self.widefield_focus_steps_label.config(text=self.widefield_focus_steps_entry.get() or "5")
+            self.widefield_focus_steps_entry.grid_remove()
+            self.widefield_focus_steps_label.grid(row=2, column=1, padx=5, pady=5)
+            self.obj_upper_limit_label.grid_remove()
+            self.obj_upper_limit_entry.grid(row=3, column=1, padx=5, pady=5)
+            self.obj_lower_limit_label.grid_remove()
+            self.obj_lower_limit_entry.grid(row=4, column=1, padx=5, pady=5)
 
         elif view == "TO_WIDE":
             # send g code to move the stage to the left
             print("Switching to wide view")
             self.prusa_go_by_xyz(z=-self.calibration_from_widefield_to_objective_z)
             self.prusa_go_by_xyz(x=-self.calibration_from_widefield_to_objective_x, y=-self.calibration_from_widefield_to_objective_y)
+            self.sample_drop_panel_enable_circles()
+            # Swap objective entries to labels, widefield labels to entries
+            self.obj_upper_limit_label.config(text=self.obj_upper_limit_entry.get() or "N/A")
+            self.obj_upper_limit_entry.grid_remove()
+            self.obj_upper_limit_label.grid(row=3, column=1, padx=5, pady=5)
+            self.obj_lower_limit_label.config(text=self.obj_lower_limit_entry.get() or "N/A")
+            self.obj_lower_limit_entry.grid_remove()
+            self.obj_lower_limit_label.grid(row=4, column=1, padx=5, pady=5)
+            self.upper_limit_label.grid_remove()
+            self.upper_limit_entry.grid(row=0, column=1, padx=5, pady=5)
+            self.lower_limit_label.grid_remove()
+            self.lower_limit_entry.grid(row=1, column=1, padx=5, pady=5)
+            self.widefield_focus_steps_label.grid_remove()
+            self.widefield_focus_steps_entry.grid(row=2, column=1, padx=5, pady=5)
         else:
             print("Error Happened", view)
 
@@ -616,6 +648,12 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         self.current_nanodrive_position = nanodrive_position
         self.current_nanodrive_z_entry.config(text=nanodrive_position)
         return None
+
+    def handle_update_objective_focus_z(self, focus_z):
+        self.objective_focus_z_label.config(text=f"Obj f Z[mm]: {focus_z}")
+
+    def handle_update_objective_focus_nd_z(self, focus_nd_z):
+        self.objective_focus_ND_z_label.config(text=f"Obj f ND Z[um]: {focus_nd_z}")
 
     def handle_test_sampling_points(self, view_to_inspect_in, relative_distance_for_sampling_points):
         # Display a confirmation dialog
@@ -641,7 +679,7 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         for i in range(len(sampling_position_x)):
             print(f'Moving to the test sample spot {sampling_position_x[i]}, {sampling_position_y[i]}')
             self.prusa_go_to_xyz(x=sampling_position_x[i], y=sampling_position_y[i])
-            time.sleep(0.1)
+            time.sleep(1)
         
         # Move back to the center of the captured frame
         if view_to_inspect_in == "OBJECTIVE":
@@ -659,6 +697,23 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         sample_position_y = np.round(fliped_relative_distance_for_sampling_point_y/1000 + sample_drop_panel_current_sample_pursa_coordinates[1], 2)
         self.prusa_go_to_xyz(x=sample_position_x, y=sample_position_y)
         
+        while True:
+            current_x = float(self.get_current_prusa_position('XYZ')[0])
+            current_y = float(self.get_current_prusa_position('XYZ')[1])
+            if current_x == sample_position_x and current_y == sample_position_y:
+                break
+
+        self.dispatch('task_completed')
+        return True
+
+    def handle_move_to_a_single_sampling_point_at_current_fov(self, relative_distance_for_sampling_point):
+        # Current-FoV mode: move relative to the captured frame center (set when the image
+        # was captured) instead of a predefined sample-drop coordinate.
+        fliped_relative_distance_for_sampling_point_y = relative_distance_for_sampling_point[1] * -1
+        sample_position_x = np.round(relative_distance_for_sampling_point[0]/1000 + self.capture_frame_center_objective_x, 2)
+        sample_position_y = np.round(fliped_relative_distance_for_sampling_point_y/1000 + self.capture_frame_center_objective_y, 2)
+        self.prusa_go_to_xyz(x=sample_position_x, y=sample_position_y)
+
         while True:
             current_x = float(self.get_current_prusa_position('XYZ')[0])
             current_y = float(self.get_current_prusa_position('XYZ')[1])
@@ -889,23 +944,49 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
 
     def register_prusa_focus_range(self):
         try:
-            self.widefield_focus_prusa_upper_limit = float(self.upper_limit_entry.get())
-            self.widefield_focus_prusa_lower_limit = float(self.lower_limit_entry.get())
-            self.widefield_focus_prusa_step_number = int(self.widefield_focus_steps_entry.get())
+            if not self.sample_drop_panel_circles_disabled:
+                # Registering from widefield view: read widefield entries, compute objective
+                self.widefield_focus_prusa_upper_limit = float(self.upper_limit_entry.get())
+                self.widefield_focus_prusa_lower_limit = float(self.lower_limit_entry.get())
+                self.objective_focus_prusa_upper_limit = round(self.widefield_focus_prusa_upper_limit + self.calibration_from_widefield_to_objective_z, 2)
+                self.objective_focus_prusa_lower_limit = round(self.widefield_focus_prusa_lower_limit + self.calibration_from_widefield_to_objective_z, 2)
+            else:
+                # Registering from objective view: read objective entries, compute widefield
+                self.objective_focus_prusa_upper_limit = float(self.obj_upper_limit_entry.get())
+                self.objective_focus_prusa_lower_limit = float(self.obj_lower_limit_entry.get())
+                self.widefield_focus_prusa_upper_limit = round(self.objective_focus_prusa_upper_limit - self.calibration_from_widefield_to_objective_z, 2)
+                self.widefield_focus_prusa_lower_limit = round(self.objective_focus_prusa_lower_limit - self.calibration_from_widefield_to_objective_z, 2)
 
-            self.objective_focus_prusa_upper_limit = round(self.widefield_focus_prusa_upper_limit + self.calibration_from_widefield_to_objective_z, 2)
-            self.objective_focus_prusa_lower_limit = round(self.widefield_focus_prusa_lower_limit + self.calibration_from_widefield_to_objective_z, 2)  
+            self.widefield_focus_prusa_step_number = int(self.widefield_focus_steps_entry.get() or self.widefield_focus_steps_label.cget('text'))
+
+            # Sync both entries and labels
+            self._set_entry_value(self.upper_limit_entry, self.widefield_focus_prusa_upper_limit)
+            self._set_entry_value(self.lower_limit_entry, self.widefield_focus_prusa_lower_limit)
+            self._set_entry_value(self.obj_upper_limit_entry, self.objective_focus_prusa_upper_limit)
+            self._set_entry_value(self.obj_lower_limit_entry, self.objective_focus_prusa_lower_limit)
+            self.upper_limit_label.config(text=self.widefield_focus_prusa_upper_limit)
+            self.lower_limit_label.config(text=self.widefield_focus_prusa_lower_limit)
+            self.obj_upper_limit_label.config(text=self.objective_focus_prusa_upper_limit)
+            self.obj_lower_limit_label.config(text=self.objective_focus_prusa_lower_limit)
+            self.widefield_focus_steps_label.config(text=self.widefield_focus_prusa_step_number)
 
             print(f"Prusa focus range for widefield camera registered: {self.widefield_focus_prusa_lower_limit} - {self.widefield_focus_prusa_upper_limit} mm")
             print(f'The offset from widefield to objective Z: {self.calibration_from_widefield_to_objective_z} mm')
             print(f'Prusa focus range for objective camera registered: {self.objective_focus_prusa_lower_limit} - {self.objective_focus_prusa_upper_limit} mm')
- 
+
             self.dispatch('activate_camera_autofocus_button')
             self.dispatch('activate_protocol_module_state','focus_range_is_setup')
             self.dispatch('update_prusa_focus_range_for_wasatch', self.objective_focus_prusa_lower_limit, self.objective_focus_prusa_upper_limit)
 
         except ValueError:
             messagebox.showerror("Input Error", "Please enter valid numeric values for the focus range.")
+
+    def _set_entry_value(self, entry, value):
+        state = entry.cget('state')
+        entry.configure(state='normal')
+        entry.delete(0, 'end')
+        entry.insert(0, value)
+        entry.configure(state=state)
 
     def sample_drop_panel_create_circle_grid(self): 
         skip_positions = [(0, 0), (3, 0), (0, 4), (3, 4)]  # Positions to skip
@@ -951,6 +1032,10 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
 
     def sample_drop_panel_move_stage(self, view_to_move_in, row, col):
 
+            if self.sample_drop_panel_circles_disabled:
+                print("Sample drop circles are disabled in objective view. Click ignored.")
+                return
+
             if not self.prusa_x_referenced or not self.prusa_y_referenced or not self.prusa_z_referenced:
                 print("Stage is not referenced. Action disabled.")
                 return  # Disable action if stage is not referenced
@@ -972,6 +1057,8 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
             self.prusa_go_to_xyz(x=sample_drop_panel_current_sample_pursa_coordinates[0], y=sample_drop_panel_current_sample_pursa_coordinates[1])
 
     def sample_drop_panel_on_hover(self, event, row, col):
+        if self.sample_drop_panel_circles_disabled:
+            return
         # Prevent changing color if hovering over the current position
         if self.sample_drop_panel_current_sample_row_column != (row, col):
             self.sample_drop_panel_canvas.itemconfig(f"circle_{row}_{col}", fill='lightgreen')
@@ -979,6 +1066,8 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         self.sample_drop_panel_tooltip.place(x=event.x_root - self.master.winfo_rootx() + 10, y=event.y_root - self.master.winfo_rooty() + 10)
 
     def sample_drop_panel_on_leave(self, event):
+        if self.sample_drop_panel_circles_disabled:
+            return
         for col_index, num_circles in enumerate(self.sample_drop_panel_grid_pattern):
             for row_index in range(num_circles):
                 if self.sample_drop_panel_current_sample_row_column != (row_index, col_index):
@@ -993,11 +1082,38 @@ class StageControlModule(ttk.Frame, Publisher, Subscriber):
         else:
             print("Stage is not referenced. Action disabled.")
 
-    def move_to_previous_quartz_slide(self):
-        pass
+    def sample_drop_panel_disable_circles(self):
+        self.sample_drop_panel_circles_disabled = True
+        skip_positions = [(0, 0), (3, 0), (0, 4), (3, 4)]
+        for col_index, num_circles in enumerate(self.sample_drop_panel_grid_pattern):
+            for row_index in range(num_circles):
+                true_row_index = row_index + (max(self.sample_drop_panel_grid_pattern) - num_circles) * self.sample_drop_panel_spacing // 2 // self.sample_drop_panel_spacing
+                if (true_row_index, col_index) in skip_positions:
+                    continue
+                tag = f"circle_{true_row_index}_{col_index}"
+                self.sample_drop_panel_canvas.itemconfig(tag, fill='grey')
+                self.sample_drop_panel_canvas.tag_unbind(tag, '<Button-1>')
+                self.sample_drop_panel_canvas.tag_unbind(tag, '<Enter>')
+                self.sample_drop_panel_canvas.tag_unbind(tag, '<Leave>')
 
-    def move_to_next_quartz_slide(self):
-        pass
+    def sample_drop_panel_enable_circles(self):
+        self.sample_drop_panel_circles_disabled = False
+        skip_positions = [(0, 0), (3, 0), (0, 4), (3, 4)]
+        for col_index, num_circles in enumerate(self.sample_drop_panel_grid_pattern):
+            for row_index in range(num_circles):
+                true_row_index = row_index + (max(self.sample_drop_panel_grid_pattern) - num_circles) * self.sample_drop_panel_spacing // 2 // self.sample_drop_panel_spacing
+                if (true_row_index, col_index) in skip_positions:
+                    continue
+                tag = f"circle_{true_row_index}_{col_index}"
+                self.sample_drop_panel_canvas.itemconfig(tag, fill='skyblue')
+                self.sample_drop_panel_canvas.tag_bind(tag, '<Button-1>',
+                    lambda event, row=true_row_index, col=col_index: self.sample_drop_panel_move_stage('WIDEFIELD', row, col))
+                self.sample_drop_panel_canvas.tag_bind(tag, '<Enter>',
+                    lambda event, row=true_row_index, col=col_index: self.sample_drop_panel_on_hover(event, row, col))
+                self.sample_drop_panel_canvas.tag_bind(tag, '<Leave>', self.sample_drop_panel_on_leave)
+        if self.sample_drop_panel_current_sample_row_column:
+            row, col = self.sample_drop_panel_current_sample_row_column
+            self.sample_drop_panel_canvas.itemconfig(f"circle_{row}_{col}", fill='yellow')
 
 if __name__ == '__main__':
     root = ttk.Window()

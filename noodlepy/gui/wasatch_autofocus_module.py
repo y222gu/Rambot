@@ -19,7 +19,7 @@ from PIL import Image, ImageTk
 
 class WasatchAutofocusModule(Publisher, ttk.Frame):
     def __init__(self, parent):
-        Publisher.__init__(self, ["update_nanodrive_position", 'task_completed', 'move_prusa_to'])
+        Publisher.__init__(self, ["update_nanodrive_position", 'task_completed', 'move_prusa_to', 'update_objective_focus_z', 'update_objective_focus_nd_z'])
         ttk.Frame.__init__(self, parent)
         self.name = "WasatchAutofocusModule"
 
@@ -47,6 +47,7 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
 
         self.prusa_focus_score_method = 'ratio'  #  or 'entropy'
         self.nanodrive_focus_score_method = 'ratio'  #  or 'entropy'
+        self.best_nanodrive_focus_position = None
 
         self.wasatch_focus_prusa_lower_limit = None
         self.wasatch_focus_prusa_upper_limit = None
@@ -99,7 +100,7 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
         self.play_button = ttk.Button(self.spectrum_frame, image=self.play_icon, command=self.start_to_play_live_spectrum_plot, bootstyle ='dark', width=5)
         self.play_button.grid(row=1, column=3, rowspan =2, sticky='ew', pady=5, padx=5)
 
-        self.capture_button = ttk.Button(self.spectrum_frame, text="Capture", bootstyle ='info-outline', command=self.capture_live_spectrum)
+        self.capture_button = ttk.Button(self.spectrum_frame, text="Capture", bootstyle ='info-outline', command=self.start_capture_live_spectrum)
         self.capture_button.grid(row=1, column=4, columnspan=2, sticky='ew', pady=5, padx=5)
 
         self.capture_number_var = StringVar()
@@ -111,6 +112,9 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
         self.plot_flag_var = ttk.BooleanVar(value=False)
         self.plot_flag_check = ttk.Checkbutton(self.spectrum_frame, text="Show Plot", variable=self.plot_flag_var, bootstyle="info")
         self.plot_flag_check.grid(row=2, column=5, sticky='ew', pady=5, padx=5)
+
+        self.capture_progress = ttk.Progressbar(self.spectrum_frame, mode='determinate', bootstyle='info')
+        self.capture_progress_label = ttk.Label(self.spectrum_frame, text="", foreground="grey")
 
         self.live_spectrum_canvas = ttk.Canvas(self.spectrum_frame, width=self.image_width, height=self.image_height)
         self.live_spectrum_canvas.grid(row=0, column=0, columnspan=6, sticky='nsew', pady=5, padx=5)
@@ -334,12 +338,18 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
         except ValueError:
             pass
 
-    def capture_live_spectrum(self):
-        # Measure requested number of spectra and save them (like handle_measure_spectra_and_save_to_specific_folder).
+    def start_capture_live_spectrum(self):
+        self.capture_button.configure(state='disabled')
         num_rep = int(float(self.capture_number_var.get() or 1))
+        self.capture_progress.configure(maximum=num_rep, value=0)
+        self.capture_progress.grid(row=3, column=0, columnspan=5, sticky='ew', pady=(0, 5), padx=5)
+        self.capture_progress_label.config(text=f"0 / {num_rep}")
+        self.capture_progress_label.grid(row=3, column=5, sticky='w', pady=(0, 5), padx=5)
+        threading.Thread(target=self._capture_live_spectrum_worker, args=(num_rep,), daemon=True).start()
 
-        # Acquire spectra (this uses self.latest_spectrum internally)
-        wavelength, wavelengths, intensities = self.measure_spectra(num_rep)
+    def _capture_live_spectrum_worker(self, num_rep):
+        # Acquire spectra with progress updates
+        wavelength, wavelengths, intensities = self.measure_spectra_with_progress(num_rep)
 
         # Prepare save folders
         spectra_folder = os.path.join(self.save_folder_path, "spectra")
@@ -369,6 +379,14 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
             metafile.write(f"Prusa position (mm): {getattr(self, 'best_prusa_focus_wasatch', None)}\n")
             metafile.write(f"Nanodrive position (um): {getattr(self, 'best_nanodrive_focus_position', None)}\n")
             metafile.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n")
+
+        # Update UI on main thread
+        self.after(0, self._capture_complete, num_rep, wavelength, intensities, filename_base)
+
+    def _capture_complete(self, num_rep, wavelength, intensities, filename_base):
+        self.capture_progress_label.config(text="Done")
+        self.capture_button.configure(state='normal')
+        self.after(2000, self._hide_capture_progress)
 
         if self.plot_flag_var.get():
             if self.units == "wavelength":
@@ -410,6 +428,10 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
             # also save the plotted figure
             fig.savefig(os.path.join(self.save_folder_path, filename_base + "_plot.png"), dpi=300)
             plt.close(fig)
+
+    def _hide_capture_progress(self):
+        self.capture_progress.grid_remove()
+        self.capture_progress_label.grid_remove()
         
     def debug_with_polystyrene(self):
         expected_peak = 1006.22
@@ -494,6 +516,7 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
 
             if self.best_prusa_focus_wasatch:
                 print("Prusa Autofocus complete")
+                self.dispatch('update_objective_focus_z', self.best_prusa_focus_wasatch)
                 return True
         else:
             print("Prusa Z-axis limits are not set. Please set them before starting autofocus.")
@@ -600,6 +623,7 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
             self.nano_drive.move_to(self.best_nanodrive_focus_position)
             time.sleep(self.nanodrive_movement_stabilization_time)
             self.dispatch("update_nanodrive_position", self.nano_drive.get_current_position())
+            self.dispatch('update_objective_focus_nd_z', self.best_nanodrive_focus_position)
 
         # set the laser power back to the initial value
         self.wasatch_manager.set_laser_power(int(self.laser_power_var.get()))
@@ -696,17 +720,30 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
         time.sleep(self.wasatch_manager.integ_time_ms / 1000.0)
 
         for i in range(int(num_rep)):
-            # spectrum = self.spectrum_queue.get()
-
             intensities.append(self.latest_spectrum)
             wavelengths.append(wavelength)
-
-            # print('Spectrum acquired:', i + 1)
-            # print('Intensity:', self.latest_spectrum)
-            # wait for the integration time
             time.sleep(self.wasatch_manager.integ_time_ms / 1000.0)
 
         return wavelength, wavelengths, intensities
+
+    def measure_spectra_with_progress(self, num_rep):
+        intensities = []
+        wavelengths = []
+        wavelength = self.wasatch_manager.settings.wavelengths
+        # wait for one exposure time to ensure the spectrometer is ready
+        time.sleep(self.wasatch_manager.integ_time_ms / 1000.0)
+
+        for i in range(int(num_rep)):
+            intensities.append(self.latest_spectrum)
+            wavelengths.append(wavelength)
+            self.after(0, self._update_capture_progress, i + 1, num_rep)
+            time.sleep(self.wasatch_manager.integ_time_ms / 1000.0)
+
+        return wavelength, wavelengths, intensities
+
+    def _update_capture_progress(self, current, total):
+        self.capture_progress.configure(value=current)
+        self.capture_progress_label.config(text=f"{current} / {total}")
 
     # def calculate_convolution_score(self, intensities):
     #     smoothed_intensity = scipy.signal.savgol_filter(intensities, self.smoothing_window_length, self.smoothing_polyorder)
@@ -799,6 +836,12 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
         self.nano_drive.move_to(position) # starting from the lowest position
         self.handle_get_nanodrive_position()
         return None
+    
+    def handle_move_nanodrive_to_during_aquisition(self, position):
+        self.nano_drive.move_to(position) # starting from the lowest position
+        self.handle_get_nanodrive_position()
+        self.dispatch("task_completed")
+        return True
 
     # def handle_update_save_folder(self, folder_path):
     #     self.save_folder_path = folder_path
@@ -834,13 +877,32 @@ class WasatchAutofocusModule(Publisher, ttk.Frame):
     def handle_get_nanodrive_min_max(self):
         return self.nano_drive.min_position_um, self.nano_drive.max_position_um
 
+    def handle_get_nanodrive_autofocus_range(self):
+        # (low_um, high_um, num_steps) used for both NanoDrive autofocus and the Z-stack
+        low = float(self.wasatch_nanodrive_autofocus_range_low_var.get())
+        high = float(self.wasatch_nanodrive_autofocus_range_high_var.get())
+        num_step = int(float(self.wasatch_nanodrive_autofocus_step_num_var.get()))
+        return low, high, num_step
+
     def handle_turn_laser_on(self, wait_for_initialization):
         self.turn_laser_on()
         if wait_for_initialization=="wait":
             time.sleep(6)  # wait for the laser to turn on
         self.dispatch("task_completed")
         return None
-    
+
+    def handle_wait_with_laser_on(self, seconds):
+        # Hold with the laser on (no spectra acquired/saved) before measuring.
+        try:
+            wait_seconds = float(seconds)
+        except (TypeError, ValueError):
+            wait_seconds = 0
+        print(f"Waiting {wait_seconds} s with the laser on before measuring.")
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        self.dispatch("task_completed")
+        return None
+
     def handle_turn_laser_off(self):
         self.turn_laser_off()
         self.dispatch("task_completed")

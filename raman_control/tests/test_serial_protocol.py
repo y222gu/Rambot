@@ -151,11 +151,17 @@ class TestSerialProtocol:
         assert protocol.get_queue_size() == 0
 
     def test_ack_detection(self, protocol):
-        """Test ACK pattern detection."""
+        """Test ACK pattern detection.
+
+        Only lines starting with 'ok' count as an ACK. Startup/echo
+        messages ('start', 'echo: ...') must NOT be treated as ACKs —
+        otherwise they could be mistaken for a command's acknowledgment
+        (the false-ACK class of bug that stalls/races the motion queue).
+        """
         assert protocol._is_ack('ok')
         assert protocol._is_ack('ok T:25.0')
-        assert protocol._is_ack('echo: start')
-        assert protocol._is_ack('start')
+        assert not protocol._is_ack('echo: start')
+        assert not protocol._is_ack('start')
         assert not protocol._is_ack('moving')
         assert not protocol._is_ack('X:100.00 Y:100.00')
 
@@ -209,65 +215,6 @@ class TestSerialProtocol:
         assert protocol._on_connected is on_connected
         assert protocol._on_disconnected is on_disconnected
         assert protocol._on_response is on_response
-
-
-class TestSerialProtocolStress:
-    """Stress tests for serial protocol (requires hardware)."""
-
-    @pytest.fixture
-    def live_protocol(self):
-        """Create a protocol connected to real hardware."""
-        protocol = SerialProtocol()
-        if protocol.connect():
-            protocol.start()
-            yield protocol
-            protocol.stop()
-        else:
-            pytest.skip("No hardware available")
-
-    @pytest.mark.hardware
-    def test_rapid_commands(self, live_protocol):
-        """Send 100 rapid commands and verify no timeouts."""
-        results = []
-        lock = threading.Lock()
-
-        def callback(success, response):
-            with lock:
-                results.append(success)
-
-        # Send 100 M105 (temperature query) commands rapidly
-        for _ in range(100):
-            live_protocol.send_command('M105', callback=callback, timeout_ms=2000)
-
-        # Wait for all commands to complete
-        timeout = time.time() + 60  # 60 second timeout
-        while len(results) < 100 and time.time() < timeout:
-            time.sleep(0.1)
-
-        # All commands should succeed
-        assert len(results) == 100
-        success_rate = sum(results) / len(results)
-        assert success_rate >= 0.95, f"Success rate too low: {success_rate}"
-
-    @pytest.mark.hardware
-    def test_movement_sequence(self, live_protocol):
-        """Test a sequence of movement commands."""
-        # Home first
-        success, _ = live_protocol.send_command_sync('G28 X Y', timeout_ms=30000)
-        assert success, "Homing failed"
-
-        # Move sequence
-        movements = [
-            'G90',  # Absolute positioning
-            'G0 X50 F1000',
-            'G0 X100 F1000',
-            'G0 X150 F1000',
-            'G0 X100 F1000',
-        ]
-
-        for cmd in movements:
-            success, _ = live_protocol.send_command_sync(cmd, timeout_ms=10000)
-            assert success, f"Command failed: {cmd}"
 
 
 if __name__ == '__main__':

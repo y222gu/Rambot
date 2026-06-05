@@ -97,7 +97,7 @@ class AutofocusPanelWidget(QWidget):
         limits_layout.addLayout(row2)
 
         # Current Z display
-        self._current_z_label = QLabel("Current Z: — mm")
+        self._current_z_label = QLabel("Current Z: - mm")
         self._current_z_label.setStyleSheet(f'''
             font-family: "SF Mono", monospace;
             font-size: 14px;

@@ -7,13 +7,16 @@ import queue
 import ttkbootstrap as ttk
 import numpy as np
 from noodlepy.gui.edgedetectorSAM import EdgeDetectorSAM
+from noodlepy.gui.edgedetectorUnet import EdgeDetectorUnet
 import os
 from threading import Thread
 from noodlepy.gui.publisher_subscriber import Publisher
 import time
 import cv2
+from skimage import filters
+
 try:
-    from noodlepy.windows_setup import configure_path
+    from noodlepy.utils.windows_setup import configure_path
     print("Configuring path...")
     configure_path()
 except ImportError:
@@ -337,9 +340,10 @@ class LiveViewModule(Publisher, tk.Frame):
         self.edge_detection_point_button.grid(row=1, column=0, sticky='nsew', pady=5, padx=5)
         sampling_method_frame = ttk.Labelframe(capture_frame, text="Sampling Method", padding=5)
         sampling_method_frame.grid(row=2, column=0, sticky='nsew', pady=5, padx=5)
-        sampling_method_frame.columnconfigure(0, weight=1)
-        sampling_method_frame.columnconfigure(1, weight=1)
-        sampling_method_frame.columnconfigure(2, weight=1)
+        sampling_method_frame.columnconfigure(0, weight=1, uniform="sampling")
+        sampling_method_frame.columnconfigure(1, weight=1, uniform="sampling")
+        sampling_method_frame.columnconfigure(2, weight=1, uniform="sampling")
+        sampling_method_frame.columnconfigure(3, weight=1, uniform="sampling")
 
         self.sampling_method_var = tk.StringVar()
         self.sampling_method_var.set("Rings")
@@ -353,11 +357,13 @@ class LiveViewModule(Publisher, tk.Frame):
         self.line_radio = ttk.Radiobutton(sampling_method_frame, text="Line", variable=self.sampling_method_var, value="Line", command=lambda: self.on_sampling_method_selected('Line'), style='info', state=NORMAL)
         self.line_radio.grid(row=0, column=3, sticky='nesw', padx=5, pady=5)
 
+        # action buttons (column 3, aligned with the two label/entry row pairs)
         self.create_sampling_profile_buttons= ttk.Button(sampling_method_frame, text="Create", command=self.on_create_button_clicked, state=DISABLED, style='info')
-        self.create_sampling_profile_buttons.grid(row=3, column=2, rowspan=2, sticky='nsew', pady=5, padx=5)
+        self.create_sampling_profile_buttons.grid(row=1, column=3, rowspan=2, sticky='nsew', pady=5, padx=5)
         self.test_sampling_points_button = ttk.Button(sampling_method_frame, text="Test", command= self.on_test_button_clicked, state=DISABLED, style='info')
-        self.test_sampling_points_button.grid(row=1, column=3, rowspan=4, sticky='nsew', pady=5, padx=5)
-        
+        self.test_sampling_points_button.grid(row=3, column=3, rowspan=2, sticky='nsew', pady=5, padx=5)
+
+        # --- first label/entry row pair (rows 1-2) ---
         # entry for the number of sampling points
         self.number_of_sampling_points_label = ttk.Label(sampling_method_frame, text="# of Points")
         self.number_of_sampling_points_label.grid(row=1, column=0, sticky='nesw', padx=5)
@@ -373,26 +379,36 @@ class LiveViewModule(Publisher, tk.Frame):
         self.rings_number_entry.insert(0, "1")
 
         # entry for the interval between rings
-        self.interval_label = ttk.Label(sampling_method_frame, text="Interval")
+        self.interval_label = ttk.Label(sampling_method_frame, text="Interval [px]")
         self.interval_label.grid(row=1, column=2, sticky='nesw', padx=5)
         self.interval_entry = ttk.Entry(sampling_method_frame, width=5)
         self.interval_entry.grid(row=2, column=2, sticky='ew', padx=5, pady=5)
         self.interval_entry.insert(0, "30")
 
+        # --- second label/entry row pair (rows 3-4) ---
         # entry for the number of rows and columns for the grid
-        self.row_number_label = ttk.Label(sampling_method_frame, text="Rows")
+        self.row_number_label = ttk.Label(sampling_method_frame, text="# of Rows")
         self.row_number_label.grid(row=3, column=0, sticky='nesw', padx=5)
         self.row_number_entry = ttk.Entry(sampling_method_frame, width=5)
         self.row_number_entry.grid(row=4, column=0, sticky='ew', padx=5, pady=5)
         self.row_number_entry.insert(0, "5")
         self.row_number_entry.configure(state=DISABLED)
 
-        self.column_number_label = ttk.Label(sampling_method_frame, text="Columns")
+        self.column_number_label = ttk.Label(sampling_method_frame, text="# of Columns")
         self.column_number_label.grid(row=3, column=1, sticky='nesw', padx=5)
         self.column_number_entry = ttk.Entry(sampling_method_frame, width=5)
         self.column_number_entry.grid(row=4, column=1, sticky='ew', padx=5, pady=5)
         self.column_number_entry.insert(0, "5")
         self.column_number_entry.configure(state=DISABLED)
+
+        # entry for the buffer distance (in pixels) of the outermost points from the
+        # detected sample edge, placed directly below the interval entry. Positive keeps
+        # points inside the edge, negative lets the points spill out of the segmented mask.
+        self.buffer_label = ttk.Label(sampling_method_frame, text="Buffer [px]")
+        self.buffer_label.grid(row=3, column=2, sticky='nesw', padx=5)
+        self.buffer_entry = ttk.Entry(sampling_method_frame, width=5)
+        self.buffer_entry.grid(row=4, column=2, sticky='ew', padx=5, pady=5)
+        self.buffer_entry.insert(0, str(self.sampling_offset_from_the_edge))
 
     def load_icon(self, icon_path):
         icon = Image.open(icon_path)
@@ -405,15 +421,15 @@ class LiveViewModule(Publisher, tk.Frame):
         thread.start()
 
     def edge_detection(self, detection_type):
-        self.edgedetector = EdgeDetectorSAM(self.captured_image)
-        # self.edgedetector = EdgeDetectorUnet(self.captured_image)
+        # self.edgedetector = EdgeDetectorSAM(self.captured_image)
+        self.edgedetector = EdgeDetectorUnet(self.captured_image)
         
-        if detection_type == "auto":
-            masked_image = self.edgedetector.auto_mask_generate()
-        elif detection_type == "point":
+        # if detection_type == "auto":
+        #     masked_image = self.edgedetector.auto_mask_generate()
+        if detection_type == "point":
             masked_image =self.edgedetector.point_prompt_mask_generate()
-        elif detection_type == "box":   
-            masked_image = self.edgedetector.box_prompt_mask_generate()
+        # elif detection_type == "box":   
+        #     masked_image = self.edgedetector.box_prompt_mask_generate()
         print("Edge detection button clicked")
 
         self.masked_image = masked_image
@@ -498,24 +514,29 @@ class LiveViewModule(Publisher, tk.Frame):
 
     def on_create_button_clicked(self):
         selected_method = self.sampling_method_var.get()
+        try:
+            buffer = int(float(self.buffer_entry.get()))
+        except (ValueError, tk.TclError):
+            buffer = self.sampling_offset_from_the_edge
+
         if selected_method == "Random":
             num_points = int(self.number_of_sampling_points_entry.get())
-            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='random', num_points=num_points)
-            
+            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='random', num_points=num_points, buffer=buffer)
+
         elif selected_method == "Grid":
             row_number = int(self.row_number_entry.get())
             col_number = int(self.column_number_entry.get())
-            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='grid', row_number=row_number, col_number=col_number)
+            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='grid', row_number=row_number, col_number=col_number, buffer=buffer)
 
         elif selected_method == "Rings":
             num_points = int(self.number_of_sampling_points_entry.get())
             num_rings = int(self.rings_number_entry.get())
             interval = int(self.interval_entry.get())
-            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='rings', num_points=num_points, num_rings=num_rings, interval=interval, offset_from_the_edge=self.sampling_offset_from_the_edge)
+            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='rings', num_points=num_points, num_rings=num_rings, interval=interval, buffer=buffer)
 
         elif selected_method == "Line":
             num_points = int(self.number_of_sampling_points_entry.get())
-            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='line', num_points=num_points)
+            sampled_mask_image, self.sampling_position_x, self.sampling_position_y, self.coordinates_order = self.edgedetector.generate_sampling_points(shape='line', num_points=num_points, buffer=buffer)
 
         self.sampled_mask_image = sampled_mask_image
         # resize the image to fit the canvas
@@ -554,10 +575,26 @@ class LiveViewModule(Publisher, tk.Frame):
                 self.captured_image_label.image = self.image_to_display
                 # save the image with high DPI (600) and no compression (use TIFF if possible)
                 try:
-                    self.captured_image.save('captured_image_600dpi.tiff', dpi=(600, 600), compression='none')
+                    base_tiff = 'captured_image.tiff'
+                    if os.path.exists(base_tiff):
+                        idx = 1
+                        while os.path.exists(f'captured_image_{idx}.tiff'):
+                            idx += 1
+                        filename = f'captured_image_{idx}.tiff'
+                    else:
+                        filename = base_tiff
+                    self.captured_image.save(filename, dpi=(600, 600), compression='none')
                 except Exception:
-                    # fallback to PNG with DPI and minimal compression
-                    self.captured_image.save('captured_image_600dpi.png', dpi=(600, 600), compress_level=0)
+                    # fallback to PNG with DPI and minimal compression, also avoid overwrite by adding index
+                    base_png = 'captured_image.png'
+                    if os.path.exists(base_png):
+                        idx = 1
+                        while os.path.exists(f'captured_image_{idx}.png'):
+                            idx += 1
+                        filename = f'captured_image_{idx}.png'
+                    else:
+                        filename = base_png
+                    self.captured_image.save(filename, dpi=(600, 600), compress_level=0)
 
                 self.edge_detection_point_button.configure(state=NORMAL)
 
@@ -572,7 +609,7 @@ class LiveViewModule(Publisher, tk.Frame):
 
     def handling_create_sampling_points_during_aquisition(self):
         # add stablization delay
-        time.sleep(2)
+        time.sleep(1)
         self.capture_frame()
         self.edge_detection('point')
         self.on_create_button_clicked()
@@ -694,6 +731,10 @@ class LiveViewModule(Publisher, tk.Frame):
     def handle_activate_switch_view_button(self):
         self.switch_view_button.configure(state=NORMAL)
         return None
+
+    def handle_get_current_camera_view(self):
+        # return the current live camera view ("WIDEFIELD" or "OBJECTIVE")
+        return self.current_live_view
 
     def handle_check_current_camera_view(self, view_to_check):
         if self.current_live_view == view_to_check:

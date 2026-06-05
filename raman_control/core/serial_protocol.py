@@ -75,8 +75,6 @@ class SerialProtocol:
         protocol.stop()
     """
 
-    # Known ACK patterns from PRUSA/Marlin firmware
-    ACK_PATTERNS = ['ok', 'echo:', 'start']
     ERROR_PATTERNS = ['error', 'Error', 'Unknown command']
 
     def __init__(
@@ -194,12 +192,28 @@ class SerialProtocol:
                 self._serial.reset_input_buffer()
                 self._serial.reset_output_buffer()
 
-                # Wait for printer to initialize
-                time.sleep(2.0)
+                # Wait for printer to finish its startup sequence.
+                # Prusa MK3 sends several seconds of startup messages
+                # (firmware version, memory, sensor status, etc.).
+                time.sleep(3.0)
 
-                # Flush startup messages
+                # Drain all startup messages
                 startup_response = self._serial.read_all().decode('utf-8', errors='replace')
                 logger.debug(f"Startup response: {startup_response}")
+
+                # Drain any remaining trickle of startup messages
+                time.sleep(1.0)
+                remaining = self._serial.read_all().decode('utf-8', errors='replace')
+                if remaining:
+                    logger.debug(f"Late startup messages: {remaining}")
+
+                # Disable auto-temperature reporting to prevent unsolicited
+                # "ok T:XX.X ..." messages from polluting the response queue.
+                # We use the keepalive M105 for temperature queries instead.
+                self._serial.write(b'M155 S0\n')
+                self._serial.flush()
+                time.sleep(0.5)
+                self._serial.read_all()  # Drain M155 response
 
                 self._connected = True
                 logger.info(f"Connected to {port} at {self.baudrate} baud")
@@ -399,6 +413,16 @@ class SerialProtocol:
                         logger.error("Serial port not open")
                         return False
 
+                    # Discard any responses still in the queue BEFORE we
+                    # send. They belong to a previous command, a retried
+                    # command, or an unsolicited echo, and would otherwise
+                    # be mistaken for THIS command's ACK — causing the
+                    # caller to race ahead while the printer is still
+                    # moving. This is what makes M400/G28 actually block
+                    # until motion completes, and is critical for the
+                    # safe-homing ordering (lift -> home -> descend).
+                    self._drain_pending_responses()
+
                     self._serial.write(cmd.command.encode('utf-8'))
                     self._serial.flush()
 
@@ -409,9 +433,25 @@ class SerialProtocol:
                 deadline = time.time() + (cmd.timeout_ms / 1000.0)
                 response_lines = []
 
+                # Check if this command expects temperature data
+                is_temp_cmd = 'M105' in cmd.command.upper()
+
                 while time.time() < deadline:
                     try:
                         response = self._response_queue.get(timeout=0.1)
+
+                        # Skip unsolicited temperature reports for
+                        # non-temperature commands. The Prusa MK3
+                        # auto-reports "ok T:XX.X ..." periodically,
+                        # which would otherwise consume the ACK slot.
+                        if (self._is_temperature_report(response)
+                                and not is_temp_cmd):
+                            logger.debug(
+                                f"Skipped unsolicited temp report "
+                                f"while waiting for: {cmd.command.strip()}"
+                            )
+                            continue
+
                         response_lines.append(response)
 
                         if self._is_ack(response):
@@ -488,9 +528,26 @@ class SerialProtocol:
         logger.info("Receive worker stopped")
 
     def _is_ack(self, response: str) -> bool:
-        """Check if response is an acknowledgment."""
-        response_lower = response.lower()
-        return any(pattern in response_lower for pattern in self.ACK_PATTERNS)
+        """
+        Check if response is a command acknowledgment.
+
+        Only lines starting with 'ok' are treated as ACK. This avoids
+        false matches on startup messages ('echo:...', 'start') and
+        other informational output from the firmware.
+        """
+        return response.strip().lower().startswith('ok')
+
+    @staticmethod
+    def _is_temperature_report(response: str) -> bool:
+        """
+        Check if response is a temperature report (``ok T:XX.X ...``).
+
+        Marlin auto-temperature reporting and M105 responses both use
+        this format. Used to filter out unsolicited temperature data
+        that would otherwise be mistaken for command ACKs.
+        """
+        stripped = response.strip()
+        return stripped.startswith('ok') and ' T:' in stripped[:15]
 
     def _is_error(self, response: str) -> bool:
         """Check if response is an error."""
@@ -541,6 +598,39 @@ class SerialProtocol:
             except queue.Empty:
                 break
         logger.info("Command queue cleared")
+
+    def _drain_pending_responses(self) -> None:
+        """Discard all buffered responses without logging (thread-safe).
+
+        Called right before each command is written so that only
+        responses arriving AFTER the command can be matched as its ACK.
+        Unlike ``drain_response_queue`` this is silent — it runs on every
+        command and must not spam the logs.
+        """
+        while True:
+            try:
+                self._response_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def drain_response_queue(self) -> int:
+        """Drain any stale responses from the response queue.
+
+        Returns the number of drained items. Call this before starting
+        a critical command sequence to ensure no stale 'ok' responses
+        can be mistaken for ACKs.
+        """
+        count = 0
+        while not self._response_queue.empty():
+            try:
+                stale = self._response_queue.get_nowait()
+                logger.debug(f"Drained stale response: {stale}")
+                count += 1
+            except queue.Empty:
+                break
+        if count:
+            logger.info(f"Drained {count} stale response(s)")
+        return count
 
     def set_callbacks(
         self,

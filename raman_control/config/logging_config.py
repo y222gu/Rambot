@@ -6,6 +6,7 @@ Provides structured logging with file and console handlers.
 
 import logging
 import logging.handlers
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -54,13 +55,15 @@ def setup_logging(
     file_handler = logging.handlers.RotatingFileHandler(
         log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB
-        backupCount=5
+        backupCount=5,
+        encoding='utf-8'
     )
     file_handler.setLevel(log_level)
     file_handler.setFormatter(detailed_formatter)
 
-    # Console handler - info and above
-    console_handler = logging.StreamHandler()
+    # Console handler - info and above (force UTF-8 on Windows)
+    console_stream = open(sys.stdout.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
+    console_handler = logging.StreamHandler(console_stream)
     console_handler.setLevel(console_level)
     console_handler.setFormatter(console_formatter)
 

@@ -62,11 +62,11 @@ logs/
 *.npz
 
 # Images (optional - uncomment if you want to track some)
-# *.png
-# *.jpg
-# *.jpeg
-# *.tif
-# *.tiff
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
 
 # OS files
 .DS_Store
@@ -81,3 +81,6 @@ local_settings.py
 *.temp
 node_modules/
 package-lock.json
+
+# Drivers
+dlls/

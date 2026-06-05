@@ -52,15 +52,7 @@ QMainWindow {{
     background-color: {COLORS['bg_dark']};
 }}
 
-QWidget {{
-    background-color: {COLORS['bg_dark']};
-    color: {COLORS['text_primary']};
-    font-family: "Segoe UI", "SF Pro Display", -apple-system, sans-serif;
-    font-size: 13px;
-}}
-
 QFrame {{
-    background-color: {COLORS['bg_dark']};
     border: none;
 }}
 
@@ -71,9 +63,9 @@ QFrame {{
 QGroupBox {{
     background-color: {COLORS['bg_medium']};
     border: 1px solid {COLORS['border_dark']};
-    border-radius: 8px;
-    margin-top: 16px;
-    padding: 16px 12px 12px 12px;
+    border-radius: 6px;
+    margin-top: 12px;
+    padding: 8px 8px 6px 8px;
     font-weight: 600;
     font-size: 13px;
 }}
@@ -81,9 +73,9 @@ QGroupBox {{
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 12px;
-    top: 4px;
-    padding: 0 8px;
+    left: 10px;
+    top: 2px;
+    padding: 0 6px;
     background-color: {COLORS['bg_medium']};
     color: {COLORS['accent_primary']};
 }}
@@ -95,9 +87,9 @@ QGroupBox::title {{
 QPushButton {{
     background-color: {COLORS['bg_elevated']};
     border: 1px solid {COLORS['border_dark']};
-    border-radius: 6px;
-    padding: 8px 16px;
-    min-height: 20px;
+    border-radius: 5px;
+    padding: 5px 12px;
+    min-height: 18px;
     font-weight: 500;
     color: {COLORS['text_primary']};
 }}
@@ -113,9 +105,9 @@ QPushButton:pressed {{
 }}
 
 QPushButton:disabled {{
-    background-color: {COLORS['bg_medium']};
-    border-color: {COLORS['border_dark']};
-    color: {COLORS['text_disabled']};
+    background-color: transparent;
+    border: 1px solid #4d4d4d;
+    color: #505050;
 }}
 
 /* Primary action buttons */
@@ -177,14 +169,96 @@ QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
     color: {COLORS['text_disabled']};
 }}
 
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+    width: 0;
+    height: 0;
+    border: none;
+}}
+
+/* ============================================
+   COMBO BOX
+   ============================================ */
+
+QComboBox {{
+    background-color: {COLORS['bg_light']};
+    border: 1px solid {COLORS['border_dark']};
+    border-radius: 4px;
+    padding: 5px 10px;
+    color: {COLORS['text_primary']};
+    min-height: 18px;
+}}
+
+QComboBox:hover {{
+    border-color: {COLORS['accent_primary']};
+}}
+
+QComboBox::drop-down {{
+    border: none;
+    width: 20px;
+}}
+
+QComboBox::down-arrow {{
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {COLORS['text_secondary']};
+    margin-right: 6px;
+}}
+
+QComboBox QAbstractItemView {{
+    background-color: {COLORS['bg_elevated']};
+    border: 1px solid {COLORS['border_light']};
+    color: {COLORS['text_primary']};
+    selection-background-color: {COLORS['selection']};
+    outline: none;
+}}
+
 /* ============================================
    LABELS
    ============================================ */
 
-QLabel {{
-    background-color: transparent;
+QLabel, QCheckBox, QRadioButton {{
+    background: transparent;
+    border: none;
+    padding: 0px;
     color: {COLORS['text_primary']};
-    padding: 2px;
+}}
+
+/* ---- Checkbox indicators ---- */
+QCheckBox::indicator {{
+    width: 14px;
+    height: 14px;
+    border: 2px solid {COLORS['text_primary']};
+    border-radius: 3px;
+    background-color: transparent;
+}}
+
+QCheckBox::indicator:hover {{
+    border-color: white;
+}}
+
+QCheckBox::indicator:checked {{
+    border-color: {COLORS['text_primary']};
+    background-color: transparent;
+}}
+
+/* ---- Radio button indicators ---- */
+QRadioButton::indicator {{
+    width: 14px;
+    height: 14px;
+    border: 2px solid {COLORS['border_light']};
+    border-radius: 9px;
+    background-color: transparent;
+}}
+
+QRadioButton::indicator:hover {{
+    border-color: {COLORS['accent_primary']};
+}}
+
+QRadioButton::indicator:checked {{
+    background-color: {COLORS['accent_primary']};
+    border-color: {COLORS['accent_primary']};
 }}
 
 QLabel[heading="true"] {{
@@ -440,9 +514,78 @@ QGraphicsView {{
 '''
 
 
+def _generate_checkmark_icon(size: int = 18) -> str:
+    """Generate a white checkmark icon on transparent background.
+
+    Returns the file path (forward slashes) for use in stylesheet
+    ``image: url(...)`` rules.
+    """
+    import tempfile, os
+    from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
+    from PyQt6.QtCore import Qt, QPoint
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pixmap)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor('white'))
+    pen.setWidth(3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    # Checkmark path scaled to size
+    p.drawLine(QPoint(3, 9), QPoint(7, 13))
+    p.drawLine(QPoint(7, 13), QPoint(14, 4))
+    p.end()
+
+    path = os.path.join(tempfile.gettempdir(), 'raman_checkmark.png')
+    pixmap.save(path)
+    return path.replace('\\', '/')
+
+
 def apply_dark_theme(app):
-    """Apply dark theme to the entire application."""
-    app.setStyleSheet(DARK_STYLESHEET)
+    """Apply dark theme to the entire application.
+
+    Uses QPalette for base window/widget colours so child widgets
+    inherit properly, then layers the stylesheet on top for borders,
+    spacing, and accent colours.  This avoids the dark-box artefact
+    caused by the old ``QWidget { background-color }`` stylesheet rule
+    fighting with ``QLabel { background: transparent }``.
+    """
+    from PyQt6.QtGui import QPalette, QColor, QFont
+
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(COLORS['bg_dark']))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(COLORS['text_primary']))
+    palette.setColor(QPalette.ColorRole.Base, QColor(COLORS['bg_light']))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(COLORS['bg_medium']))
+    palette.setColor(QPalette.ColorRole.Text, QColor(COLORS['text_primary']))
+    palette.setColor(QPalette.ColorRole.Button, QColor(COLORS['bg_elevated']))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(COLORS['text_primary']))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(COLORS['accent_primary']))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(COLORS['bg_dark']))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(COLORS['bg_elevated']))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(COLORS['text_primary']))
+
+    # Disabled state
+    palette.setColor(QPalette.ColorGroup.Disabled,
+                     QPalette.ColorRole.WindowText, QColor(COLORS['text_disabled']))
+    palette.setColor(QPalette.ColorGroup.Disabled,
+                     QPalette.ColorRole.Text, QColor(COLORS['text_disabled']))
+    palette.setColor(QPalette.ColorGroup.Disabled,
+                     QPalette.ColorRole.ButtonText, QColor(COLORS['text_disabled']))
+
+    app.setPalette(palette)
+    app.setFont(QFont("Segoe UI", 10))
+
+    # Generate white checkmark icon and inject into stylesheet
+    checkmark_path = _generate_checkmark_icon()
+    stylesheet = DARK_STYLESHEET + f'''
+    QCheckBox::indicator:checked {{
+        image: url({checkmark_path});
+    }}
+    '''
+    app.setStyleSheet(stylesheet)
 
 
 def get_pyqtgraph_theme():
