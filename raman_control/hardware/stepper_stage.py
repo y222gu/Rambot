@@ -218,10 +218,38 @@ class StepperStage(MotionDevice):
                 return False
 
         if self._protocol.start():
+            self._initialize_state()
             self._start_keepalive()
             return True
 
         return False
+
+    def _initialize_state(self) -> None:
+        """Put the printer in a known, safe state at session start.
+
+        A previous session that was closed improperly (e.g. the app crashed
+        mid-move) can leave the printer still executing a buffered move and/or
+        in a non-default mode. Those leftovers desync the FIFO command/ACK
+        matching, which can make the next homing skip its protective Z lift and
+        drive Z into the sample. Starting every session by waiting for the
+        printer to go idle and forcing absolute mode + soft endstops on clears
+        that state.
+
+          M400    -> block until any moves left over from before have finished
+          G90     -> absolute positioning
+          M211 S1 -> soft endstops enabled
+        """
+        try:
+            # Wait (synchronously) for any buffered/in-flight move to finish so
+            # its late 'ok' can't desync the commands that follow.
+            self._protocol.send_command_sync('M400', timeout_ms=60000)
+            self._protocol.send_command_sync('G90', timeout_ms=10000)
+            self._protocol.send_command_sync('M211 S1', timeout_ms=10000)
+            self._protocol.drain_response_queue()
+            self.logger.info("Stage state initialized (idle, absolute, soft "
+                             "endstops on)")
+        except Exception as e:  # noqa: BLE001 - never block startup
+            self.logger.warning(f"Stage state init failed: {e}")
 
     def stop(self) -> None:
         """Stop the stage controller."""
@@ -321,7 +349,7 @@ class StepperStage(MotionDevice):
         def _do_post_homing_safety_raise(ok: bool, _resp: str):
             """After M400 confirms homing physically done, raise Z."""
             if not ok:
-                self.logger.warning("M400 after homing failed — raising Z anyway")
+                self.logger.warning("M400 after homing failed, raising Z anyway")
             self.logger.info(
                 f"Raising Z to safety height "
                 f"({self.config.safety_height} mm)"
@@ -416,19 +444,35 @@ class StepperStage(MotionDevice):
                 'M400', callback=on_lift_settled, timeout_ms=60000
             )
 
-        # --- Start the chain ---
-        if has_z:
-            # Lift first, then home everything together so Z_SAFE_HOMING
-            # repositions XY before probing Z.
-            _pre_home_safety_lift()
-        elif has_xy:
-            # XY-only home: no Z risk, no lift needed.
-            _do_home()
-        else:
+        def _begin(_ok: bool = True, _resp: str = ""):
+            # Re-drain: clear any responses that arrived while settling (e.g. a
+            # late 'ok' from a move left over by a previously crashed session).
+            # This guarantees the safety-critical lift+G28 sequence starts with
+            # a synchronized command/ACK stream, so the M400 barrier after the
+            # lift can't be satisfied early by a stale 'ok'.
+            self._protocol.drain_response_queue()
+            if has_z:
+                # Lift first, then home everything together so Z_SAFE_HOMING
+                # repositions XY before probing Z.
+                _pre_home_safety_lift()
+            elif has_xy:
+                # XY-only home: no Z risk, no lift needed.
+                _do_home()
+            else:
+                self.logger.warning(f"No valid axes to home: {axes}")
+                self._start_keepalive()
+
+        if not (has_z or has_xy):
             self.logger.warning(f"No valid axes to home: {axes}")
             self._start_keepalive()
             return False
 
+        # --- Start the chain ---
+        # Settle first: block (via the queue) until the printer is idle so the
+        # homing sequence below starts from a known, synchronized state. An
+        # in-flight move from an improperly-closed prior session would otherwise
+        # desync ACK matching and could bypass the pre-home Z lift.
+        self._protocol.send_command('M400', callback=_begin, timeout_ms=60000)
         return True
 
     def get_position(self) -> Tuple[float, float, float]:

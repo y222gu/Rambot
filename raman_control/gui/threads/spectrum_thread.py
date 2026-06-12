@@ -9,6 +9,7 @@ Provides non-blocking spectrum acquisition with:
 - Thread-safe spectrum delivery via Qt signals
 """
 
+import threading
 import time
 from typing import Optional
 import numpy as np
@@ -65,6 +66,20 @@ class SpectrumThread(QThread):
 
         # Latest spectrum storage for on-demand access
         self._latest_spectrum: Optional[np.ndarray] = None
+
+        # On-demand "acquire N fresh exposures" request, serviced by the run
+        # loop (the only thread that may touch the hardware). A worker sets
+        # _frames_request = N, waits on _frames_done, then reads _frames_result.
+        self._frames_request: Optional[int] = None
+        self._frames_result: Optional[np.ndarray] = None
+        self._frames_done = threading.Event()
+
+        # Pending hardware setting changes (integration time / laser power /
+        # laser enable). Setters queue here instead of touching the device
+        # directly; the run loop applies them between reads so the USB device is
+        # only ever accessed from this one thread (concurrent access from a
+        # caller thread + the run loop's get_line() causes libusb timeouts).
+        self._pending_settings: dict = {}
 
         # Wasatch SDK objects
         self._device = None
@@ -132,6 +147,31 @@ class SpectrumThread(QThread):
         min_emit_interval = 0.05  # 20 Hz max update rate
 
         while self._running:
+            # Apply any queued setting changes (integration time / laser) on
+            # THIS thread, before any read, so the device is never accessed
+            # concurrently from a caller thread and a get_line() here.
+            self._apply_pending_settings()
+
+            # Service an on-demand averaged-acquisition request first. This is
+            # the path the auto-acquisition worker uses so its "Averaging"
+            # really means N independent exposures (not N reads of one cached
+            # free-running frame). Hardware is only ever touched here.
+            with QMutexLocker(self._mutex):
+                req = self._frames_request
+            if req is not None:
+                result = self._capture_frames(req)
+                with QMutexLocker(self._mutex):
+                    self._frames_result = result
+                    self._frames_request = None
+                    if result is not None and len(result):
+                        self._latest_spectrum = result.mean(
+                            axis=0).astype(np.float32)
+                self._frames_done.set()
+                if result is not None and len(result):
+                    self.spectrum_ready.emit(
+                        self._wavelengths, self._latest_spectrum, time.time())
+                continue
+
             if self._acquiring:
                 acq_start = time.time()
 
@@ -185,13 +225,11 @@ class SpectrumThread(QThread):
         logger.info("Spectrum acquisition stopped")
 
     def set_integration_time(self, time_ms: float):
-        """Set integration time in milliseconds."""
+        """Set integration time in milliseconds (applied on the spectrum
+        thread between reads — never touches the device from the caller)."""
         self._config.integration_time = time_ms
-        if not self._simulated and self._fid is not None:
-            try:
-                self._fid.set_integration_time_ms(time_ms)
-            except Exception as e:
-                logger.error(f"Failed to set integration time on hardware: {e}")
+        with QMutexLocker(self._mutex):
+            self._pending_settings['integration_time_ms'] = time_ms
         logger.info(f"Integration time set to {time_ms} ms")
 
     def set_laser_power(self, power_percent: float):
@@ -200,26 +238,40 @@ class SpectrumThread(QThread):
         logger.info(f"Laser power set to {power_percent}%")
 
     def set_laser_power_mw(self, power_mw: float):
-        """Set laser power in milliwatts."""
+        """Set laser power in milliwatts (applied on the spectrum thread)."""
         self._config.laser_power_mw = power_mw
-        if not self._simulated and self._fid is not None:
-            try:
-                self._fid.set_laser_power_mW(power_mw)
-            except Exception as e:
-                logger.error(f"Failed to set laser power on hardware: {e}")
+        with QMutexLocker(self._mutex):
+            self._pending_settings['laser_power_mw'] = power_mw
         logger.info(f"Laser power set to {power_mw} mW")
 
     def set_laser(self, on: bool):
-        """Turn laser on or off."""
+        """Turn laser on or off (applied on the spectrum thread)."""
         with QMutexLocker(self._mutex):
             self._laser_on = on
-        if not self._simulated and self._fid is not None:
-            try:
-                self._fid.set_laser_enable(on)
-            except Exception as e:
-                logger.error(f"Failed to set laser state on hardware: {e}")
+            self._pending_settings['laser_enable'] = on
         self.laser_state_changed.emit(on)
         logger.info(f"Laser {'ON' if on else 'OFF'}")
+
+    def _apply_pending_settings(self):
+        """Apply queued setting changes to the device. Runs ONLY on the spectrum
+        thread (the run loop), so the USB device is never accessed concurrently
+        with a get_line() read."""
+        with QMutexLocker(self._mutex):
+            if not self._pending_settings:
+                return
+            pending = self._pending_settings
+            self._pending_settings = {}
+        if self._simulated or self._fid is None:
+            return
+        try:
+            if 'integration_time_ms' in pending:
+                self._fid.set_integration_time_ms(pending['integration_time_ms'])
+            if 'laser_power_mw' in pending:
+                self._fid.set_laser_power_mW(pending['laser_power_mw'])
+            if 'laser_enable' in pending:
+                self._fid.set_laser_enable(pending['laser_enable'])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to apply spectrometer settings: {e}")
 
     def get_latest_spectrum(self) -> Optional[np.ndarray]:
         """Get the most recently acquired spectrum (thread-safe)."""
@@ -227,6 +279,58 @@ class SpectrumThread(QThread):
             if self._latest_spectrum is not None:
                 return self._latest_spectrum.copy()
             return None
+
+    def acquire_frames(self, n: int, timeout: Optional[float] = None
+                       ) -> Optional[np.ndarray]:
+        """Acquire ``n`` genuinely fresh exposures and return them stacked as an
+        (m, pixels) array (m <= n, m = successful exposures), or None.
+
+        For use from a worker thread: the acquisition runs on the spectrometer
+        thread (the hardware owner), so the frames are independent exposures
+        rather than repeated reads of the free-running cache. Blocks until the
+        frames are captured or ``timeout`` (seconds) elapses.
+        """
+        n = max(1, int(n))
+        with QMutexLocker(self._mutex):
+            if not self._connected:
+                return None
+        if timeout is None:
+            # Generous: n integration times plus headroom.
+            timeout = max(10.0, (self._config.integration_time / 1000.0) * n * 3 + 10)
+
+        self._frames_done.clear()
+        with QMutexLocker(self._mutex):
+            self._frames_result = None
+            self._frames_request = n
+
+        if not self._frames_done.wait(timeout):
+            with QMutexLocker(self._mutex):
+                self._frames_request = None
+            logger.warning(f"acquire_frames({n}) timed out")
+            return None
+        with QMutexLocker(self._mutex):
+            return None if self._frames_result is None else self._frames_result.copy()
+
+    def acquire_average(self, n: int, timeout: Optional[float] = None
+                        ) -> Optional[np.ndarray]:
+        """Mean of ``n`` fresh exposures (see :meth:`acquire_frames`)."""
+        frames = self.acquire_frames(n, timeout)
+        if frames is None or not len(frames):
+            return None
+        return frames.mean(axis=0).astype(np.float32)
+
+    def _capture_frames(self, n: int) -> Optional[np.ndarray]:
+        """Acquire ``n`` exposures back-to-back on this (owner) thread."""
+        frames = []
+        for _ in range(max(1, n)):
+            if not self._running:
+                break
+            s = self._acquire_spectrum()
+            if s is not None:
+                frames.append(np.asarray(s, dtype=np.float32))
+        if not frames:
+            return None
+        return np.array(frames, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Internal: connect / disconnect / acquire

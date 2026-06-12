@@ -29,6 +29,7 @@ from raman_control.config.hardware_config import CameraConfig
 from raman_control.segmentation.pattern_generator import (
     PatternGenerator, CalibrationParams, SamplePosition,
 )
+from raman_control.segmentation import pattern_layouts
 
 logger = get_logger('live_view')
 
@@ -265,8 +266,10 @@ class ImageDisplayWidget(QLabel):
                 wx, wy = self._image_to_widget(px, py)
                 painter.drawEllipse(QPointF(wx, wy), 4, 4)
 
-        # Crosshair at the widget center.
-        if self._show_crosshair:
+        # Crosshair at the widget center — only at full (un-zoomed) view, where
+        # the centre marks the true field centre. Once zoomed/panned it no
+        # longer marks the centre, so it's hidden even if the toggle is on.
+        if self._show_crosshair and self._zoom <= 1.0:
             pen = QPen(QColor(COLORS['accent_primary']))
             pen.setWidth(1)
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -485,6 +488,16 @@ class ClickableLabel(QLabel):
         self._dragged = False
         # Live "you are here" marker: (base_x, base_y, radius_base_px) or None.
         self._probe_marker: Optional[Tuple[float, float, float]] = None
+        # Scale bar: object-plane micrometers per base-pixmap pixel (0 = hidden).
+        # The bar length is chosen adaptively so it stays a sensible on-screen
+        # size at any zoom (see _draw_scale_bar).
+        self._scalebar_um_per_px: float = 0.0
+
+    def set_scale_bar(self, um_per_pixel: float):
+        """Show a bottom-right scale bar sized from ``um_per_pixel`` (object-plane
+        micrometers per image/base-pixmap pixel). Pass 0 to hide it."""
+        self._scalebar_um_per_px = float(um_per_pixel or 0.0)
+        self.update()
 
     def set_probe_marker(self, marker: Optional[Tuple[float, float, float]]):
         """Set the green probe marker as (base_x, base_y, radius_base_px), or
@@ -590,9 +603,67 @@ class ClickableLabel(QLabel):
             painter.setBrush(QBrush(QColor(46, 204, 113, 110)))
             painter.drawEllipse(QPointF(wx, wy), wr, wr)
 
+        self._draw_scale_bar(painter)
         if self._zoom > 1.0:
             self._draw_minimap(painter)
         painter.end()
+
+    @staticmethod
+    def _nice_length_um(target_um: float) -> float:
+        """Round ``target_um`` down to a 1/2/5 x 10^n 'nice' value for a tidy
+        scale-bar label."""
+        if target_um <= 0:
+            return 0.0
+        import math
+        exp = math.floor(math.log10(target_um))
+        base = target_um / (10 ** exp)
+        nice = 1 if base < 2 else 2 if base < 5 else 5
+        return nice * (10 ** exp)
+
+    def _draw_scale_bar(self, painter: QPainter):
+        """Bottom-right scale bar. The length is chosen adaptively (~1/4 of the
+        visible width, rounded to a nice value) so it stays readable at any zoom
+        and on previews of different sizes."""
+        if self._scalebar_um_per_px <= 0 or self._base_pixmap is None:
+            return
+        scale = self._scale()
+        if scale <= 0:
+            return
+        # Target ~1/4 of the visible width in micrometers, then pick a nice value.
+        target_um = (self.width() / 4.0) / scale * self._scalebar_um_per_px
+        bar_um = self._nice_length_um(target_um)
+        if bar_um <= 0:
+            return
+        bar_disp = (bar_um / self._scalebar_um_per_px) * scale
+        sw, sh = self.width(), self.height()
+        if not (4 < bar_disp < sw):
+            return
+        margin, thickness, pad = 12, 4, 4
+        label = (f"{bar_um / 1000:g} mm" if bar_um >= 1000 else f"{bar_um:g} um")
+        font = QFont("Segoe UI", 9)
+        font.setBold(True)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        text_h = fm.height()
+        text_w = fm.horizontalAdvance(label)
+
+        bar_x2 = sw - margin
+        bar_x1 = bar_x2 - bar_disp
+        bar_y = sh - margin - thickness
+        block_w = max(bar_disp, text_w)
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 150)))
+        painter.drawRoundedRect(
+            int(bar_x2 - block_w - pad), int(bar_y - text_h - pad),
+            int(block_w + 2 * pad), int(text_h + thickness + 2 * pad), 4, 4)
+        painter.setBrush(QBrush(QColor('white')))
+        painter.drawRect(int(bar_x1), int(bar_y), int(round(bar_disp)), thickness)
+        painter.setPen(QPen(QColor('white')))
+        tx = int(bar_x2 - bar_disp / 2 - text_w / 2)
+        ty = int(bar_y - pad)
+        painter.drawText(tx, ty, label)
 
     def _draw_minimap(self, painter: QPainter):
         bw, bh = self._bw_bh()
@@ -768,6 +839,9 @@ class LiveViewWidget(QWidget):
     segmentation_progress = pyqtSignal(int, str)
     # Camera autofocus requested with the number of Prusa Z steps to scan.
     camera_autofocus_requested = pyqtSignal(int)
+    # Point add/delete edit mode changed: 'add' / 'delete' on enter, '' on exit.
+    # Lets the Auto-Acquisition FoV preview mirror this tab's Confirm/Cancel UI.
+    point_edit_mode_changed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -988,6 +1062,7 @@ class LiveViewWidget(QWidget):
 
         self._capture_btn = QPushButton("Capture")
         self._capture_btn.setStyleSheet(CYAN_BTN_STYLE)
+        self._capture_btn.setEnabled(False)  # until the widefield camera connects
         self._capture_btn.clicked.connect(self._on_capture)
         ctrl_row.addWidget(self._capture_btn)
 
@@ -1022,7 +1097,18 @@ class LiveViewWidget(QWidget):
             font-size: 11px;
         '''
         self._capture_preview.setStyleSheet(self._capture_placeholder_style)
+        # Scale bar: the captured image is always the widefield camera, so use
+        # its object-plane pixel size.
+        self._capture_preview.set_scale_bar(self._widefield_config.pixel_size_x_um)
         cap_lay.addWidget(self._capture_preview)
+        # Hint that the captured image is clickable to drive the stage — only
+        # shown once sample points exist (see _update_cap_hint).
+        self._cap_hint = QLabel("Click on a point to move over")
+        self._cap_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cap_hint.setStyleSheet(
+            f'color: {COLORS["text_secondary"]}; font-size: 11px;')
+        self._cap_hint.setVisible(False)
+        cap_lay.addWidget(self._cap_hint)
         right.addWidget(cap_group)
 
         # Segmentation section (always uses the trained U-Net model).
@@ -1042,7 +1128,8 @@ class LiveViewWidget(QWidget):
         self._center_btn.setEnabled(False)
         self._center_btn.setStyleSheet(CYAN_OUTLINE_BTN_STYLE)
         self._center_btn.setToolTip(
-            "Move the center of the segmented sample to the center of the live view"
+            "⚠ Moves the stage: drives the centre of the segmented sample "
+            "to the centre of the live view"
         )
         self._center_btn.clicked.connect(self._on_center_clicked)
         model_row.addWidget(self._center_btn, 1)
@@ -1060,7 +1147,7 @@ class LiveViewWidget(QWidget):
         pat_lay.setContentsMargins(6, 6, 6, 6)
         pat_lay.setSpacing(8)
 
-        # Normal controls live in their own container so Add/Clear Points can
+        # Normal controls live in their own container so Add/Remove Points can
         # swap the whole panel for a Confirm/Cancel editing view.
         self._pattern_normal = QWidget()
         normal_lay = QVBoxLayout(self._pattern_normal)
@@ -1179,7 +1266,7 @@ class LiveViewWidget(QWidget):
             "when two points are closer than this (i.e. too close to resolve)."
         )
         self._show_labels_chk = QCheckBox("Show #")
-        self._show_labels_chk.setChecked(False)
+        self._show_labels_chk.setChecked(True)
         self._show_labels_chk.setToolTip("Show the point number next to each marker")
         self._show_labels_chk.toggled.connect(lambda _: self._update_capture_preview())
 
@@ -1204,38 +1291,54 @@ class LiveViewWidget(QWidget):
         params_row.addLayout(marker_holder)
         normal_lay.addLayout(params_row)
 
+        # Generate / Add / Clear share one row.
         self._gen_pattern_btn = QPushButton("Generate Points")
         self._gen_pattern_btn.setEnabled(False)
         self._gen_pattern_btn.setStyleSheet(CYAN_BTN_STYLE)
         self._gen_pattern_btn.clicked.connect(self._on_generate_pattern)
-        normal_lay.addWidget(self._gen_pattern_btn)
 
-        # Manual point editing: each enters a Confirm/Cancel editing mode.
-        point_row = QHBoxLayout()
-        self._add_point_btn = QPushButton("Add Point")
+        self._add_point_btn = QPushButton("Add Points")
         self._add_point_btn.setStyleSheet(CYAN_OUTLINE_BTN_STYLE)
         self._add_point_btn.setToolTip(
-            "Add custom points by clicking the captured image"
-        )
+            "Add custom points by clicking the captured image")
         self._add_point_btn.clicked.connect(lambda: self._enter_edit_mode('add'))
-        point_row.addWidget(self._add_point_btn)
-        self._clear_points_btn = QPushButton("Clear Points")
+
+        self._clear_points_btn = QPushButton("Remove Points")
         self._clear_points_btn.setStyleSheet(CYAN_OUTLINE_BTN_STYLE)
         self._clear_points_btn.setToolTip(
-            "Remove points by clicking them on the captured image"
-        )
+            "Remove points by clicking them on the captured image")
         self._clear_points_btn.clicked.connect(lambda: self._enter_edit_mode('delete'))
-        point_row.addWidget(self._clear_points_btn)
-        normal_lay.addLayout(point_row)
+        # Add/Clear edit the segmented result, so they're enabled only once
+        # segmentation has produced a mask (see _on_seg_finished).
+        self._add_point_btn.setEnabled(False)
+        self._clear_points_btn.setEnabled(False)
 
-        # Status label (left) and the "Show #" toggle (right edge), on the
-        # row below the Add/Clear buttons.
+        gen_row = QHBoxLayout()
+        gen_row.setSpacing(6)
+        gen_row.addWidget(self._gen_pattern_btn)
+        gen_row.addWidget(self._add_point_btn)
+        gen_row.addWidget(self._clear_points_btn)
+        normal_lay.addLayout(gen_row)
+
+        # Remove-outside-mask toggle (OFF by default: points outside the mask
+        # are KEPT unless the user opts in). The Show # toggle sits below it.
+        self._remove_outside_chk = QCheckBox("Remove Points Outside the Mask")
+        self._remove_outside_chk.setChecked(False)
+        self._remove_outside_chk.setToolTip(
+            "When checked, generated points that fall outside the segmented mask "
+            "are discarded. Off by default, all generated points are kept. "
+            "Toggling re-generates the points right away.")
+        self._remove_outside_chk.toggled.connect(self._on_remove_outside_toggled)
+        normal_lay.addWidget(self._remove_outside_chk)
+
+        normal_lay.addWidget(self._show_labels_chk)
+
+        # Status label on its own row.
         status_row = QHBoxLayout()
         self._pattern_status = QLabel("Run segmentation first")
         self._pattern_status.setStyleSheet(f'color: {COLORS["text_secondary"]}; font-size: 11px;')
         status_row.addWidget(self._pattern_status)
         status_row.addStretch()
-        status_row.addWidget(self._show_labels_chk)
         normal_lay.addLayout(status_row)
 
         pat_lay.addWidget(self._pattern_normal)
@@ -1305,6 +1408,14 @@ class LiveViewWidget(QWidget):
                 background-color: rgba(20, 20, 20, 175);
                 border: 1px solid {COLORS['border_dark']};
                 border-radius: 6px;
+            }}
+            /* Only the overlay itself is boxed, strip any border/background
+               from the individual items so there's a single shared boundary. */
+            QWidget#imageOverlay QLabel,
+            QWidget#imageOverlay QSlider,
+            QWidget#imageOverlay QCheckBox {{
+                border: none;
+                background: transparent;
             }}
         ''')
         row = QHBoxLayout(self._image_overlay)
@@ -1379,10 +1490,33 @@ class LiveViewWidget(QWidget):
         if self._widefield_thread:
             self._widefield_thread.frame_ready.connect(self._on_wide_frame)
             self._widefield_thread.connected.connect(self._on_wide_connected)
+            self._widefield_thread.disconnected.connect(
+                self._on_camera_disconnected)
 
         if self._objective_thread:
             self._objective_thread.frame_ready.connect(self._on_obj_frame)
             self._objective_thread.connected.connect(self._on_obj_connected)
+            self._objective_thread.disconnected.connect(
+                self._on_camera_disconnected)
+
+    def _on_camera_disconnected(self):
+        """When the cameras go away (devices disconnected), disable the play
+        button — there's nothing to stream."""
+        wide_on = self._widefield_thread and self._widefield_thread.is_connected
+        obj_on = self._objective_thread and self._objective_thread.is_connected
+        if not (wide_on or obj_on):
+            self._acquiring = False
+            self._acq_btn.setChecked(False)
+            self._update_acq_btn(False)
+            self._acq_btn.setEnabled(False)
+        self._update_capture_btn()
+
+    def _update_capture_btn(self):
+        """Capture grabs the WIDEFIELD frame, so it's only available when the
+        widefield camera is connected AND that view is shown."""
+        wide_on = bool(self._widefield_thread
+                       and self._widefield_thread.is_connected)
+        self._capture_btn.setEnabled(wide_on and self._current_camera == 'wide')
 
     def _process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Apply CLAHE contrast and smoothing (display-only, does not modify source)."""
@@ -1429,6 +1563,7 @@ class LiveViewWidget(QWidget):
         self._acq_btn.setEnabled(True)
         self._update_acq_btn(True)
         self._acq_btn.setChecked(True)
+        self._update_capture_btn()
 
     def _on_obj_connected(self):
         if self._current_camera == 'objective':
@@ -1460,9 +1595,9 @@ class LiveViewWidget(QWidget):
             self._on_edit_cancel()
         self._seg_group.setEnabled(is_wide)
         self._pat_group.setEnabled(is_wide)
-        # Capture grabs the widefield frame, so it's disabled (greyed) in
-        # objective view.
-        self._capture_btn.setEnabled(is_wide)
+        # Capture grabs the widefield frame, so it's only enabled in widefield
+        # view AND while the widefield camera is connected.
+        self._update_capture_btn()
 
         self._update_scale_bar()
 
@@ -1475,7 +1610,7 @@ class LiveViewWidget(QWidget):
         if self._current_camera == 'wide':
             self._display.set_scale_bar(500.0, self._widefield_config.pixel_size_x_um)
         else:
-            self._display.set_scale_bar(100.0, self._objective_config.pixel_size_x_um)
+            self._display.set_scale_bar(20.0, self._objective_config.pixel_size_x_um)
 
     def refresh_calibration(self):
         """Re-read the pixel-size calibration and update overlays.
@@ -1637,7 +1772,7 @@ class LiveViewWidget(QWidget):
         # Z, and an XY move from there could crash it.
         if not self._probe_in_area:
             self._pattern_status.setText(
-                "Probe is outside the captured area — move back in to click points")
+                "Probe is outside the captured area. Move back in to click points")
             return
         if not self._generated_positions:
             return
@@ -1749,12 +1884,62 @@ class LiveViewWidget(QWidget):
         for i, p in enumerate(self._generated_positions):
             p.id = i + 1
 
+    # ---- Public point-editing API (used by the Auto-Acquisition FoV preview) --
+    # The Current-FoV preview in the Auto-Acquisition tab mirrors this tab's
+    # composite pixmap, so it can edit the SAME point list by forwarding clicks
+    # here (no duplicate editing logic, one source of truth for the points).
+
+    def can_add_points(self) -> bool:
+        """True when a captured image (hence a pixel->stage calibration) exists,
+        so manual points can be added to / removed from the captured FoV."""
+        return (self._captured_image is not None
+                and self._make_calibration() is not None)
+
+    def edit_point_at_base(self, base_x: int, base_y: int, mode: str) -> bool:
+        """Add or delete a sample point from a click on a mirror of this tab's
+        composite preview. ``base_x/base_y`` are in base-pixmap pixels (the same
+        coordinate space the captured-image preview emits); ``mode`` is 'add' or
+        'delete'. Returns False if the click fell outside the captured image."""
+        coords = self._label_to_image_coords(int(base_x), int(base_y))
+        if coords is None:
+            return False
+        if mode == 'add':
+            self._add_custom_point(*coords)
+        elif mode == 'delete':
+            self._delete_nearest_point(*coords)
+        else:
+            return False
+        return True
+
+    # The Auto-Acquisition tab reuses the SAME edit session (snapshot + revert)
+    # so its Add/Remove buttons behave identically and stay in sync via the
+    # point_edit_mode_changed signal.
+    def begin_point_edit(self, mode: str):
+        """Enter add/delete edit mode (snapshots points for Cancel)."""
+        self._enter_edit_mode(mode)
+
+    def confirm_point_edit(self):
+        """Keep the edits made this session and leave edit mode."""
+        if self._edit_mode is not None:
+            self._on_edit_confirm()
+
+    def cancel_point_edit(self):
+        """Revert to the snapshot taken on entry and leave edit mode."""
+        if self._edit_mode is not None:
+            self._on_edit_cancel()
+
+    @property
+    def point_edit_mode(self) -> Optional[str]:
+        """The active edit mode ('add' / 'delete'), or None."""
+        return self._edit_mode
+
     def _enter_edit_mode(self, mode: str):
         """Enter point add/delete mode: hide other panels, show Confirm/Cancel.
 
         Snapshots the current points so Cancel can revert this session.
         """
-        if self._captured_image is None or self._edit_mode is not None:
+        if (self._captured_image is None or self._current_mask is None
+                or self._edit_mode is not None):
             return
         self._edit_mode = mode
         # Snapshot (shallow copies of the parallel lists) for revert on Cancel.
@@ -1771,6 +1956,8 @@ class LiveViewWidget(QWidget):
         self._seg_group.setVisible(False)
         self._pattern_normal.setVisible(False)
         self._pattern_edit.setVisible(True)
+        # Let mirrors (Auto-Acquisition FoV preview) swap to Confirm/Cancel too.
+        self.point_edit_mode_changed.emit(mode)
 
     def _exit_edit_mode(self):
         """Leave edit mode and restore the normal panels."""
@@ -1779,6 +1966,7 @@ class LiveViewWidget(QWidget):
         self._pattern_edit.setVisible(False)
         self._pattern_normal.setVisible(True)
         self._seg_group.setVisible(True)
+        self.point_edit_mode_changed.emit('')
 
     def _on_edit_confirm(self):
         """Keep the points edited in this session and return to normal."""
@@ -1802,6 +1990,20 @@ class LiveViewWidget(QWidget):
 
     # ---- Capture preview helpers ----
 
+    def _update_cap_hint(self):
+        """Show the captured-image click hint once points exist. The text also
+        reminds the user to reference the stage first when it isn't referenced
+        (clicking a point can't move the stage until then)."""
+        if not hasattr(self, '_cap_hint'):
+            return
+        has_points = bool(self._generated_positions)
+        self._cap_hint.setVisible(has_points)
+        if has_points and not self._stage_referenced:
+            self._cap_hint.setText(
+                "Reference the stage first, then click a point to move over")
+        else:
+            self._cap_hint.setText("Click on a point to move over")
+
     def _update_capture_preview(self):
         """Render the captured image + overlays into the preview.
 
@@ -1814,6 +2016,8 @@ class LiveViewWidget(QWidget):
         """
         if self._captured_image is None:
             return
+        # The click-to-move hint is only meaningful once points exist.
+        self._update_cap_hint()
 
         image = self._captured_image
         if image.ndim == 2:
@@ -1868,9 +2072,17 @@ class LiveViewWidget(QWidget):
                     painter.drawEllipse(QPointF(sx, sy), rr, rr)
 
                     if show_labels:
-                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        text = str(idx + 1)
+                        # Size the bold font so the number fits INSIDE the marker
+                        # (fewer digits -> bigger), then draw it centred + black.
+                        fs = max(5, int(1.6 * rr / (0.6 * len(text) + 0.3)))
+                        label_font.setPixelSize(fs)
                         painter.setFont(label_font)
-                        painter.drawText(QPointF(sx + rr + 2 * ss, sy - rr), str(idx + 1))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.setPen(QPen(QColor('black')))
+                        painter.drawText(
+                            QRectF(sx - rr, sy - rr, 2 * rr, 2 * rr),
+                            int(Qt.AlignmentFlag.AlignCenter), text)
 
             painter.end()
 
@@ -1911,6 +2123,10 @@ class LiveViewWidget(QWidget):
         # Center is available with a captured image AND a referenced stage.
         self._update_center_enabled()
         self._gen_pattern_btn.setEnabled(False)  # needs a mask
+        # Capturing clears the previous mask, so point editing is unavailable
+        # again until segmentation runs (re-enabled in _on_seg_finished).
+        self._add_point_btn.setEnabled(False)
+        self._clear_points_btn.setEnabled(False)
         return True
 
     def _on_capture(self):
@@ -1976,6 +2192,11 @@ class LiveViewWidget(QWidget):
             self._current_mask = mask
             self._update_capture_preview()
             self._gen_pattern_btn.setEnabled(True)
+            # Segmentation produced a mask (now displayed) -> point editing is
+            # available (but not mid auto-center).
+            if not self._centering_active:
+                self._add_point_btn.setEnabled(True)
+                self._clear_points_btn.setEnabled(True)
             # Don't re-enable Center mid auto-center; _finish_centering does it.
             self._update_center_enabled()
             area_px = int(np.sum(mask))
@@ -2012,13 +2233,13 @@ class LiveViewWidget(QWidget):
         self._seg_worker = None
 
     def _update_center_enabled(self):
-        """Center needs a captured image, a referenced stage, AND the probe
-        inside the captured area (it moves the stage; out-of-area means the
-        probe may be far away / at an unsafe Z — same guard as point clicks)."""
+        """Center needs a captured image and a referenced stage. It stays
+        available even when the probe has moved outside the captured area (the
+        user asked to be able to re-centre from anywhere); the tooltip warns it
+        moves the stage."""
         self._center_btn.setEnabled(
             self._captured_image is not None
             and self._stage_referenced
-            and self._probe_in_area
             and not self._centering_active
         )
 
@@ -2192,6 +2413,13 @@ class LiveViewWidget(QWidget):
         px_um = self._widefield_config.pixel_size_x_um or 1.0
         return um / px_um
 
+    def _on_remove_outside_toggled(self, _checked: bool):
+        """Re-generate the points immediately so the change takes effect — but
+        only when a pattern has already been generated (mask + points exist)."""
+        if (self._current_mask is not None and self._edit_mode is None
+                and self._generated_positions):
+            self._on_generate_pattern()
+
     def _on_pattern_changed(self, idx: int):
         self._pattern_stack.setCurrentIndex(idx)
 
@@ -2255,188 +2483,95 @@ class LiveViewWidget(QWidget):
         self.positions_generated.emit(positions)
         logger.info(f"Generated {len(positions)} sample points ({pattern})")
 
-    def _apply_buffer(self, mask, buffer_px):
-        """Shrink or expand the binary mask by ``buffer_px`` pixels.
-
-        buffer_px > 0  -> erode: keep points at least that far INSIDE the edge
-        buffer_px < 0  -> dilate: allow points that far OUTSIDE the mask
-        buffer_px == 0 -> unchanged
-        """
-        b = int(buffer_px)
-        if b == 0:
-            return (mask > 0).astype(np.uint8)
-        ksize = 2 * abs(b) + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-        m = (mask > 0).astype(np.uint8)
-        return cv2.erode(m, kernel) if b > 0 else cv2.dilate(m, kernel)
+    # The pattern algorithms live in raman_control.segmentation.pattern_layouts
+    # so the acquisition worker can reuse them headlessly (off the GUI thread).
+    # These wrappers just read the spinboxes (µm buffers -> px) and delegate.
 
     def _generate_grid(self, mask, xs, ys, h, w):
-        """Grid pattern: meshgrid over the buffered mask bbox, keep points inside it."""
-        rows_n = self._grid_rows.value()
-        cols_n = self._grid_cols.value()
-
-        # Apply the buffer (um -> px): positive shrinks the region, negative
-        # expands it so grid points can fall outside the original mask.
-        bmask = self._apply_buffer(mask, self._um_to_px(self._grid_buffer.value()))
-        bys, bxs = np.where(bmask == 1)
-        if bxs.size == 0:
-            return [], []
-
-        x_lin = np.linspace(bxs.min(), bxs.max(), cols_n)
-        y_lin = np.linspace(bys.min(), bys.max(), rows_n)
-        xx, yy = np.meshgrid(x_lin, y_lin)
-        xx_flat = xx.flatten()
-        yy_flat = yy.flatten()
-
-        # Check which points are inside the buffered mask
-        ix = np.clip(np.round(xx_flat).astype(int), 0, w - 1)
-        iy = np.clip(np.round(yy_flat).astype(int), 0, h - 1)
-        inside = bmask[iy, ix] == 1
-
-        # Compute row/col indices for all candidates, filter by inside
-        col_indices = np.tile(np.arange(cols_n), rows_n)
-        row_indices = np.repeat(np.arange(rows_n), cols_n)
-
-        points = [(float(xx_flat[i]), float(yy_flat[i])) for i in range(len(xx_flat)) if inside[i]]
-        orders = [
-            {'row': int(row_indices[i]) + 1, 'col': int(col_indices[i]) + 1}
-            for i in range(len(xx_flat)) if inside[i]
-        ]
-        return points, orders
+        """Grid pattern (delegates to pattern_layouts.generate_grid)."""
+        return pattern_layouts.generate_grid(mask, {
+            'rows': self._grid_rows.value(),
+            'cols': self._grid_cols.value(),
+            'buffer_px': self._um_to_px(self._grid_buffer.value()),
+            'remove_outside': self._remove_outside_chk.isChecked(),
+        })
 
     def _generate_ring(self, mask, xs, ys, h, w):
-        """Ring/radial pattern matching old noodlepy edgedetectorSAM.py."""
-        num_rays = self._ring_rays.value()
-        num_rings = self._ring_rings.value()
-        interval = self._um_to_px(self._ring_interval.value())
-        buffer_px = self._um_to_px(self._ring_buffer.value())
-        # Validity region: eroded (buffer>0) or dilated (buffer<0) mask, so a
-        # negative buffer lets the outer ring sit outside the segmented edge.
-        bmask = self._apply_buffer(mask, buffer_px)
-
-        center_x = float(xs.mean())
-        center_y = float(ys.mean())
-
-        all_x, all_y = [], []
-        ring_numbers, line_numbers = [], []
-
-        angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
-
-        for ray_idx, angle in enumerate(angles):
-            dx = np.cos(angle)
-            dy = np.sin(angle)
-
-            # Find edge distance along this ray
-            max_dist = max(w, h)
-            edge_dist = 0
-            for dist in range(int(max_dist)):
-                x_i = int(center_x + dist * dx)
-                y_i = int(center_y + dist * dy)
-                if x_i < 0 or x_i >= w or y_i < 0 or y_i >= h or mask[y_i, x_i] == 0:
-                    edge_dist = dist - 1
-                    break
-
-            if edge_dist <= 0:
-                continue
-
-            # Place points from the (buffered) edge inward. A negative buffer
-            # moves the start beyond the edge so points land outside the mask.
-            start_dist = edge_dist - buffer_px
-            min_dist_from_center = 10
-
-            for ring_idx in range(num_rings):
-                d = start_dist - ring_idx * interval
-                if d > min_dist_from_center:
-                    px = center_x + d * dx
-                    py = center_y + d * dy
-                    ipx, ipy = int(px), int(py)
-                    if 0 <= ipx < w and 0 <= ipy < h and bmask[ipy, ipx] > 0:
-                        all_x.append(px)
-                        all_y.append(py)
-                        ring_numbers.append(ring_idx + 1)
-                        line_numbers.append(ray_idx + 1)
-
-        if not all_x:
-            return [], []
-
-        all_x = np.array(all_x)
-        all_y = np.array(all_y)
-        ring_numbers = np.array(ring_numbers)
-        line_numbers = np.array(line_numbers)
-
-        # Sort by angle, rotate to start from min-Y point
-        point_angles = np.arctan2(all_y - center_y, all_x - center_x)
-        sorted_idx = np.argsort(point_angles)
-        all_x = all_x[sorted_idx]
-        all_y = all_y[sorted_idx]
-        ring_numbers = ring_numbers[sorted_idx]
-        line_numbers = line_numbers[sorted_idx]
-
-        min_y_index = int(np.argmin(all_y))
-        all_x = np.roll(all_x, -min_y_index)
-        all_y = np.roll(all_y, -min_y_index)
-        ring_numbers = np.roll(ring_numbers, -min_y_index)
-        line_numbers = np.roll(line_numbers, -min_y_index)
-
-        points = [(float(x), float(y)) for x, y in zip(all_x, all_y)]
-        orders = [
-            {'ring': int(r), 'line': int(l)}
-            for r, l in zip(ring_numbers, line_numbers)
-        ]
-        return points, orders
+        """Ring/radial pattern (delegates to pattern_layouts.generate_ring)."""
+        return pattern_layouts.generate_ring(mask, {
+            'rays': self._ring_rays.value(),
+            'rings': self._ring_rings.value(),
+            'interval_px': self._um_to_px(self._ring_interval.value()),
+            'buffer_px': self._um_to_px(self._ring_buffer.value()),
+            'remove_outside': self._remove_outside_chk.isChecked(),
+        })
 
     def _generate_line(self, mask, xs, ys, h, w):
-        """Line pattern: find largest contiguous segment at centroid row (buffered)."""
-        num = self._line_points.value()
-        # Apply buffer (um -> px): positive shrinks the segment, negative
-        # extends it past the original mask edge.
-        bmask = self._apply_buffer(mask, self._um_to_px(self._line_buffer.value()))
-        cx = int(np.round(xs.mean()))
-        cy = int(np.round(ys.mean()))
-
-        # Search outward from centroid for a row with mask pixels
-        found_row = None
-        sampling_x = None
-        for off in range(h):
-            for r in ((cy + off, cy - off) if off else (cy,)):
-                if 0 <= r < h:
-                    cols = np.where(bmask[r] == 1)[0]
-                    if cols.size > 0:
-                        # Pick largest contiguous segment
-                        diffs = np.diff(cols)
-                        splits = np.where(diffs > 1)[0]
-                        segments = []
-                        start = 0
-                        for s in splits:
-                            segments.append(cols[start:s + 1])
-                            start = s + 1
-                        segments.append(cols[start:])
-                        largest = max(segments, key=len)
-                        xmin, xmax = float(largest[0]), float(largest[-1])
-                        sampling_x = np.linspace(xmin, xmax, num)
-                        found_row = r
-                        break
-            if found_row is not None:
-                break
-
-        if sampling_x is None:
-            # Fallback: use full mask horizontal span at centroid row
-            xmin, xmax = float(xs.min()), float(xs.max())
-            sampling_x = np.linspace(xmin, xmax, num)
-            found_row = cy
-
-        points = [(float(x), float(found_row)) for x in sampling_x]
-        orders = [{'line_pos': i + 1} for i in range(len(points))]
-        return points, orders
+        """Line pattern (delegates to pattern_layouts.generate_line)."""
+        return pattern_layouts.generate_line(mask, {
+            'points': self._line_points.value(),
+            'buffer_px': self._um_to_px(self._line_buffer.value()),
+        })
 
     def _generate_random(self, mask, xs, ys):
-        """Random pattern: random sample from mask pixels."""
-        num = self._rand_points.value()
-        n = min(num, len(xs))
-        indices = np.random.choice(len(xs), n, replace=False)
-        points = [(float(xs[i]), float(ys[i])) for i in indices]
-        orders = []  # No meaningful order for random
-        return points, orders
+        """Random pattern (delegates to pattern_layouts.generate_random)."""
+        return pattern_layouts.generate_random(mask, {
+            'points': self._rand_points.value(),
+        })
+
+    # ---- Reuse hooks for the Robotic Deposition acquisition worker ----
+
+    _PATTERN_NAMES = ('grid', 'ring', 'line', 'random')
+
+    def snapshot_pattern_settings(self) -> dict:
+        """Snapshot the current pattern type + params (GUI thread) so a worker
+        can regenerate the same pattern on each droplet at run time.
+
+        Buffers/intervals are returned BOTH in µm (raw spinbox) and pre-converted
+        to pixels, plus the pixel-size calibration, so the worker needs no Qt."""
+        idx = self._pattern_btn_group.checkedId()
+        name = self._PATTERN_NAMES[idx] if 0 <= idx < 4 else 'ring'
+        px_um = self._widefield_config.pixel_size_x_um or 1.0
+        remove_outside = self._remove_outside_chk.isChecked()
+        return {
+            'type': name,
+            'pixel_size_x_um': self._widefield_config.pixel_size_x_um,
+            'pixel_size_y_um': self._widefield_config.pixel_size_y_um,
+            'invert_y': True,
+            # Per-pattern numeric params, buffers/intervals already in pixels.
+            'grid': {
+                'rows': self._grid_rows.value(),
+                'cols': self._grid_cols.value(),
+                'buffer_px': self._grid_buffer.value() / px_um,
+                'remove_outside': remove_outside,
+            },
+            'ring': {
+                'rays': self._ring_rays.value(),
+                'rings': self._ring_rings.value(),
+                'interval_px': self._ring_interval.value() / px_um,
+                'buffer_px': self._ring_buffer.value() / px_um,
+                'remove_outside': remove_outside,
+            },
+            'line': {
+                'points': self._line_points.value(),
+                'buffer_px': self._line_buffer.value() / px_um,
+            },
+            'random': {
+                'points': self._rand_points.value(),
+            },
+        }
+
+    def get_segmenter(self):
+        """Return the cached U-Net segmenter, creating + loading it if needed.
+
+        Call on the GUI thread (model load is slow) BEFORE handing the segmenter
+        to a worker; the worker then calls ``segment()`` off-thread."""
+        if self._segmenter is None:
+            from raman_control.segmentation import UNetSegmenter
+            self._segmenter = UNetSegmenter()
+        if not self._segmenter.is_loaded:
+            self._segmenter.load_model()
+        return self._segmenter
 
     # ---- Clear ----
 
@@ -2446,6 +2581,76 @@ class LiveViewWidget(QWidget):
         self._stage_referenced = all_referenced
         self._update_center_enabled()  # Center moves the stage
         self._update_switch_enabled()
+        self._update_cap_hint()  # hint reminds to reference the stage if needed
+
+    def widefield_um_per_px(self) -> float:
+        """Object-plane micrometers per widefield pixel (0 if uncalibrated).
+
+        The captured image is always the widefield camera, so mirrors of it (the
+        Auto-Acquisition FoV preview) use this to draw a matching scale bar."""
+        return self._widefield_config.pixel_size_x_um or 0.0
+
+    def show_external_capture(self, image, mask, positions, capture_xyz):
+        """Display a captured + segmented droplet produced OUTSIDE the Live tab
+        (by the Robotic Deposition run), so the user can watch each droplet's
+        image, segmentation overlay and generated points update as the robot
+        moves between droplets.
+
+        ``positions`` is a list of SamplePosition; their pixel_x/pixel_y drive
+        the on-image markers. ``mask`` may be None and ``positions`` empty when a
+        droplet segmented to nothing (the image still updates, showing the move).
+        """
+        if image is None:
+            return
+        self._captured_image = self._process_frame(image)
+        self._captured_camera = 'wide'
+        self._capture_stage_position = tuple(capture_xyz)
+        self._current_mask = mask
+        self._generated_positions = list(positions)
+        self._sample_points = [(p.pixel_x, p.pixel_y)
+                               for p in self._generated_positions]
+        self._selected_point_id = None
+        self._capture_preview.reset_view()  # fresh droplet image, start un-zoomed
+        self._update_capture_preview()
+        if mask is not None:
+            area_px = int(np.sum(mask > 0))
+            self._seg_status.setText(f"Droplet segmented: {area_px} px")
+        else:
+            self._seg_status.setText("Droplet: nothing segmented")
+        # Mirror into the Auto-Acquisition FoV preview + point count.
+        self.positions_generated.emit(self._generated_positions)
+
+    def reset_capture_state(self):
+        """Clear the captured image, segmentation mask and all sample points,
+        returning the Captured-Image / Segmentation / Sample-Pattern panels to
+        their pre-capture state.
+
+        Called on hardware disconnect: the captured image's pixel->stage
+        calibration is anchored to the home position, which is lost on
+        disconnect (the stage must be re-referenced), so the old capture and the
+        points generated from it are no longer valid. Any in-progress point-edit
+        session is abandoned first."""
+        if self._edit_mode is not None:
+            self._exit_edit_mode()
+        self._captured_image = None
+        self._current_mask = None
+        self._sample_points = []
+        self._generated_positions = []
+        self._selected_point_id = None
+        self._capture_stage_position = (0.0, 0.0, 0.0)
+        self._capture_preview.reset_view()
+        self._capture_preview.set_base_pixmap(None)
+        self._capture_preview.setText("No capture")
+        # Buttons gate on capture/mask/points, so disable them again.
+        self._run_seg_btn.setEnabled(False)
+        self._gen_pattern_btn.setEnabled(False)
+        self._add_point_btn.setEnabled(False)
+        self._clear_points_btn.setEnabled(False)
+        self._seg_status.setText("")
+        self._pattern_status.setText("Run segmentation first")
+        self._update_cap_hint()
+        # Republish the now-empty point list so the Auto-Acquisition tab clears.
+        self.positions_generated.emit(self._generated_positions)
 
     def set_autofocus_registered(self, registered: bool):
         """Gate the FOV switch on a registered autofocus range.

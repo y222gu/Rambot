@@ -83,7 +83,7 @@ class LEDThread(QThread):
             logger.error(f"LED write failed: {e}")
             # No close/reopen here — that would risk hanging the CH340. If the
             # board was unplugged, re-plug it and press the button again.
-            self.error.emit("write failed — re-plug the LED and press \U0001F4A1")
+            self.error.emit("write failed, re-plug the LED and press \U0001F4A1")
 
     def run(self) -> None:
         logger.info("LED thread starting")

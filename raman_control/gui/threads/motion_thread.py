@@ -337,3 +337,37 @@ class MotionThread(QThread):
             logger.warning(f"move_z_blocking timed out moving to Z={z}")
             return False
         return result['ok']
+
+    def move_xyz_blocking(
+        self,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        z: Optional[float] = None,
+        speed: Optional[int] = None,
+        timeout: float = 60.0,
+    ) -> bool:
+        """Move to an absolute (x, y, z) and block until the move completes.
+
+        Like :meth:`move_z_blocking` but for full XYZ moves — for use from a
+        worker thread (e.g. the acquisition loop). NEVER call this on the GUI
+        thread; it would freeze the UI. Any axis left as None keeps its current
+        value. The mutex is held only while the command is queued; the wait
+        happens outside it so the GUI thread is never blocked.
+        """
+        done = threading.Event()
+        result = {'ok': False}
+
+        def _cb(success: bool):
+            result['ok'] = bool(success)
+            done.set()
+
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                return False
+            self._stage.move_to(x=x, y=y, z=z, speed=speed, callback=_cb)
+
+        if not done.wait(timeout):
+            logger.warning(
+                f"move_xyz_blocking timed out moving to ({x}, {y}, {z})")
+            return False
+        return result['ok']

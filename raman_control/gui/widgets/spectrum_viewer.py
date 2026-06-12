@@ -127,8 +127,8 @@ class SpectrumViewerWidget(QWidget):
 
         controls_layout.addStretch()
 
-        # Crosshair x/y readout, at the right of the bottom control row.
-        controls_layout.addWidget(self._cursor_label)
+        # Crosshair x/y readout is drawn on the plot itself (orange, top-left),
+        # not in the control row — see self._crosshair_text in _setup_plot.
 
         main_layout.addWidget(controls_frame)
 
@@ -259,14 +259,18 @@ class SpectrumViewerWidget(QWidget):
         self._af_prusa_btn.setStyleSheet(_af_btn_style)
         self._af_prusa_btn.setEnabled(False)  # until a range is registered
         self._af_prusa_btn.setToolTip(
-            "Coarse autofocus: step the Prusa Z across the range and pick the best focus")
+            "Coarse autofocus: step the Prusa Z across the range and pick the "
+            "best focus.\nOnly available in objective view (the objective must "
+            "be over the sample). Switch to Objective first.")
         self._af_prusa_btn.clicked.connect(self._on_prusa_autofocus_clicked)
 
         self._af_nano_btn = QPushButton("Focus with Nanodrive")
         self._af_nano_btn.setStyleSheet(_af_btn_style)
         self._af_nano_btn.setEnabled(False)  # until a range is registered
         self._af_nano_btn.setToolTip(
-            "Fine autofocus: step the NanoDrive across the range and pick the best focus")
+            "Fine autofocus: step the NanoDrive across the range and pick the "
+            "best focus.\nOnly available in objective view (the objective must "
+            "be over the sample). Switch to Objective first.")
         self._af_nano_btn.clicked.connect(self._on_nano_autofocus_clicked)
 
         btn_row = QHBoxLayout()
@@ -358,6 +362,19 @@ class SpectrumViewerWidget(QWidget):
         self._plot_widget.addItem(self._hline, ignoreBounds=True)
         self._vline.hide()
         self._hline.hide()
+
+        # Crosshair X/Y readout drawn in the plot's top-LEFT corner (orange), so
+        # it doesn't take space in the control bar. anchor=(0,0) puts the text's
+        # top-left corner at the placement point; we re-pin it to the current
+        # view's top-left on every range change (sigRangeChanged), so it stays
+        # put even while autoscale moves the Y axis.
+        self._crosshair_text = pg.TextItem(text="", color=(255, 165, 0),
+                                           anchor=(0, 0))
+        self._crosshair_text.setZValue(100)
+        self._plot_widget.addItem(self._crosshair_text, ignoreBounds=True)
+        self._crosshair_text.hide()
+        self._plot_widget.plotItem.vb.sigRangeChanged.connect(
+            self._position_crosshair_text)
 
         # Mouse tracking - DISABLED by default for performance
         # Only enabled when crosshair checkbox is checked
@@ -551,6 +568,7 @@ class SpectrumViewerWidget(QWidget):
                 color: #505050;
             }}
         ''')
+        self._capture_btn.setEnabled(False)  # until the spectrometer connects
         self._capture_btn.clicked.connect(self._on_capture_clicked)
 
         # --- Buttons / capture controls, on the right of the field columns ---
@@ -692,6 +710,7 @@ class SpectrumViewerWidget(QWidget):
         """Handle spectrometer connection."""
         self._acq_btn.setEnabled(True)
         self._laser_btn.setEnabled(True)
+        self._capture_btn.setEnabled(True)
         # Auto-start acquisition on connect and reflect it on the play button
         # (checked + pause icon / filled style).
         if self._spectrum_thread:
@@ -709,6 +728,7 @@ class SpectrumViewerWidget(QWidget):
         self._acq_btn.setEnabled(False)
         self._laser_btn.setChecked(False)
         self._laser_btn.setEnabled(False)
+        self._capture_btn.setEnabled(False)
         logger.info("Spectrometer disconnected")
 
     def _on_laser_state_changed(self, is_on: bool):
@@ -876,7 +896,7 @@ class SpectrumViewerWidget(QWidget):
         else:
             self._vline.hide()
             self._hline.hide()
-            self._cursor_label.setText("")
+            self._crosshair_text.hide()
             self._crosshair_x = None
             # Disable mouse tracking when crosshair is hidden for better performance
             if self._mouse_tracking_enabled:
@@ -919,11 +939,24 @@ class SpectrumViewerWidget(QWidget):
             yv = float(self._current_spectrum[idx])
             self._hline.setPos(yv)
             unit = "nm" if self._x_in_nm else "cm⁻¹"
+            xname = "Wavelength" if self._x_in_nm else "Raman Shift"
             xfmt = f"{xv:.1f}" if self._x_in_nm else f"{xv:.0f}"
-            self._cursor_label.setText(f"{xfmt} {unit}   I = {yv:.0f}")
+            self._crosshair_text.setText(
+                f"{xname} = {xfmt} {unit}\nIntensity = {yv:.0f}")
+            self._crosshair_text.show()
+            self._position_crosshair_text()
         elif fallback_y is not None:
             self._hline.setPos(fallback_y)
-            self._cursor_label.setText(f"I = {fallback_y:.0f}")
+            self._crosshair_text.setText(f"Intensity = {fallback_y:.0f}")
+            self._crosshair_text.show()
+            self._position_crosshair_text()
+
+    def _position_crosshair_text(self, *args):
+        """Pin the crosshair readout to the top-left corner of the current
+        view. Called on each readout update AND on every view-range change
+        (e.g. autoscale), so it never drifts with the Y axis."""
+        (xmin, _xmax), (_ymin, ymax) = self._plot_widget.plotItem.vb.viewRange()
+        self._crosshair_text.setPos(xmin, ymax)
 
     def set_spectrum_thread(self, thread: SpectrumThread):
         """Set or update the spectrum thread."""

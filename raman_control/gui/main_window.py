@@ -24,10 +24,14 @@ from raman_control.config.logging_config import setup_logging, get_logger
 from raman_control.config.hardware_config import HardwareConfig
 from raman_control.gui.styles import DARK_STYLESHEET, COLORS, apply_dark_theme
 from raman_control.gui.wheel_filter import install_wheel_guard
+from raman_control.gui.tooltip_style import install_fast_tooltips
 from raman_control.gui.threads.motion_thread import MotionThread
 from raman_control.gui.threads.camera_thread import CameraThread
 from raman_control.gui.threads.spectrum_thread import SpectrumThread
 from raman_control.gui.threads.autofocus_thread import AutofocusWorker
+from raman_control.gui.threads.acquisition_thread import (
+    AcquisitionWorker, AcquisitionContext)
+from raman_control.gui.threads.robotic_thread import RoboticDepositionWorker
 from raman_control.gui.threads.led_thread import LEDThread
 from raman_control.gui.widgets.stage_control import StageControlWidget
 from raman_control.gui.widgets.led_control import LEDControlWidget
@@ -202,10 +206,24 @@ class MainWindow(QMainWindow):
         self._af_registered = False
         self._af_worker: Optional[AutofocusWorker] = None
 
+        # Current-FoV acquisition worker (one run at a time).
+        self._acq_worker: Optional[AcquisitionWorker] = None
+        # Snapshot of widget enabled-states while the UI is locked mid-run.
+        self._ui_lock_snapshot: dict = {}
+        # Hardware shutdown runs at most once (closeEvent and aboutToQuit both
+        # call it; the flag makes the second call a no-op).
+        self._shutdown_done = False
+
         self._setup_window()
         self._setup_central_widget()
         self._setup_statusbar()
         self._init_threads()
+
+        # Backstop: make sure hardware (esp. the LED serial port) is shut down
+        # cleanly even on exit paths that bypass closeEvent (e.g. app.quit()).
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown_hardware)
 
         # Auto-connect to all devices on startup, deferred until the event loop
         # is running so the window paints first and the connect stays responsive.
@@ -354,6 +372,8 @@ class MainWindow(QMainWindow):
         # --- Right side of the status bar ---
         # Connect/Disconnect sits just right of the device indicators; Settings
         # and About are pushed to the far-right corner.
+        # Connect/Disconnect stays in the status bar, just right of the device
+        # indicators.
         self._connect_btn = QPushButton("Connect")
         self._connect_btn.setMinimumHeight(28)
         self._connect_btn.setMinimumWidth(110)
@@ -366,7 +386,6 @@ class MainWindow(QMainWindow):
         self._settings_btn.setMinimumHeight(28)
         self._settings_btn.setStyleSheet(self._TOOLBAR_BTN_CONNECT)
         self._settings_btn.clicked.connect(self._on_open_settings)
-        self._status_widget.add_right_widget(self._settings_btn, separator=True)
 
         # About is a flat, borderless element (matches the old toolbar action
         # look) rather than a bordered button.
@@ -374,7 +393,16 @@ class MainWindow(QMainWindow):
         self._about_btn.setMinimumHeight(28)
         self._about_btn.setStyleSheet(self._TOOLBAR_BTN_FLAT)
         self._about_btn.clicked.connect(self._show_about)
-        self._status_widget.add_right_widget(self._about_btn)
+
+        # Settings + About live in the top-right corner of the tab bar (same row
+        # as the tabs), About to the right of Settings.
+        _tab_corner = QWidget()
+        _tab_corner_lay = QHBoxLayout(_tab_corner)
+        _tab_corner_lay.setContentsMargins(0, 0, 6, 0)
+        _tab_corner_lay.setSpacing(4)
+        _tab_corner_lay.addWidget(self._settings_btn)
+        _tab_corner_lay.addWidget(self._about_btn)
+        self._tab_widget.setCornerWidget(_tab_corner, Qt.Corner.TopRightCorner)
 
         self.statusBar().setStyleSheet(f'''
             QStatusBar {{
@@ -413,6 +441,8 @@ class MainWindow(QMainWindow):
 
         # Autofocus scan ranges registered from the stage panel
         self._stage_control.ranges_registered.connect(self._on_ranges_registered)
+        # ...and invalidated (e.g. on disconnect): re-lock the AF-gated buttons.
+        self._stage_control.registration_reset.connect(self._on_registration_reset)
 
         # Camera autofocus requested from the live view control bar
         self._live_view.camera_autofocus_requested.connect(self._on_camera_autofocus)
@@ -443,6 +473,23 @@ class MainWindow(QMainWindow):
 
         # Sample grid well click → move stage
         self._sample_grid.position_selected.connect(self._on_well_clicked)
+
+        # Keep the Live-tab and Auto-tab droplet maps in sync: loading a config
+        # in one applies the same sample colours to the other. apply_config does
+        # not re-emit, so there's no feedback loop.
+        auto_grid = getattr(self._protocol_panel, '_sample_grid', None)
+        if auto_grid is not None:
+            self._sample_grid.config_loaded.connect(auto_grid.apply_config)
+            auto_grid.config_loaded.connect(self._sample_grid.apply_config)
+
+        # Current-FoV acquisition: the panel requests, the worker (owned here)
+        # runs over the points generated on the captured image.
+        self._protocol_panel.acquisition_requested.connect(
+            self._on_start_current_fov)
+        self._protocol_panel.robotic_requested.connect(self._on_start_robotic)
+        self._protocol_panel.pause_requested.connect(self._on_acq_pause)
+        self._protocol_panel.resume_requested.connect(self._on_acq_resume)
+        self._protocol_panel.stop_requested.connect(self._on_acq_stop)
 
         # The illumination LED is independent of the measurement hardware: it
         # connects at launch and stays available (controls are always live and
@@ -538,9 +585,15 @@ class MainWindow(QMainWindow):
         if self._devices_connected:
             self._connect_btn.setText("Disconnect")
             self._connect_btn.setStyleSheet(self._TOOLBAR_BTN_CYAN)
+            self._connect_btn.setToolTip(
+                "Disconnect all hardware.\n"
+                "Warning: you will lose the calibrated home position. The stage "
+                "must be re-referenced (Reference All) after reconnecting, and the "
+                "current captured image and sample points will be cleared.")
         else:
             self._connect_btn.setText("Connect")
             self._connect_btn.setStyleSheet(self._TOOLBAR_BTN_CONNECT)
+            self._connect_btn.setToolTip("Connect to all hardware.")
 
     def _on_connect_toggle(self):
         if self._devices_connected:
@@ -590,6 +643,13 @@ class MainWindow(QMainWindow):
             self._nanodrive.disconnect()
             self._status_widget.set_device_connected('NanoDrive', False)
 
+        # Re-initialise the capture/segmentation/points state: the stage must be
+        # re-referenced after reconnecting, which invalidates the captured
+        # image's home-anchored calibration and the points generated from it.
+        # (The stage-referenced gating itself resets via stage_control's
+        # referenced_changed on the motion thread's 'disconnected' signal.)
+        self._live_view.reset_capture_state()
+
         self._devices_connected = False
         self._update_connect_button_state()
 
@@ -608,6 +668,57 @@ class MainWindow(QMainWindow):
         self._current_position = (x, y, z)
         # Track the live "you are here" marker on the captured image.
         self._live_view.update_probe_marker()
+        # Keep the live-tab droplet map in sync with where the stage actually is.
+        self._sync_droplet_map_to_position(x, y)
+
+    def _well_at_position(self, x: float, y: float):
+        """The (row, col) of the droplet-map well the physical stage position is
+        over, or None if it's more than half a well-pitch from any valid well."""
+        grid = getattr(self, '_sample_grid', None)
+        if grid is None:
+            return None
+        drop = self._config.sample_drop
+        stage = self._config.stage
+        pitch = drop.well_pitch_mm or 1.0
+        cm = self._coordinate_manager
+        # The well grid is in widefield (logical) coords; convert the physical
+        # stage position back to logical (remove the objective offset in obj view).
+        if cm.current_view == CameraView.OBJECTIVE:
+            lx, ly = x - cm.offset_x, y - cm.offset_y
+        else:
+            lx, ly = x, y
+        row_f = (lx - stage.home_x - drop.offset_home_to_a1_x) / pitch
+        col_f = (ly - stage.home_y - drop.offset_home_to_a1_y) / pitch
+        row, col = round(row_f), round(col_f)
+        dist = ((row_f - row) ** 2 + (col_f - col) ** 2) ** 0.5 * pitch
+        if dist <= pitch * 0.5 and grid.is_valid_well(row, col):
+            return (row, col)
+        return None
+
+    def _sync_droplet_map_to_position(self, x: float, y: float):
+        """Highlight the droplet-map well the stage is currently over (live tab),
+        or clear the highlight + label once it moves away, so the map reflects
+        the real position."""
+        grid = getattr(self, '_sample_grid', None)
+        if grid is None:
+            return
+        well = self._well_at_position(x, y)
+        if well is not None:
+            grid.set_current_position(*well)
+        else:
+            grid.clear_current_position()
+
+    def _droplet_info_at_position(self, x: float, y: float):
+        """(well_name, sample_name, droplet_number) for the well at the given
+        physical position. well_name is None if not over a valid well; sample
+        name / number are None if no config is loaded for that well."""
+        well = self._well_at_position(x, y)
+        if well is None:
+            return None, None, None
+        from raman_control.gui.widgets.sample_grid import well_name
+        name = well_name(*well)
+        info = self._sample_grid.droplet_map().get(name) or {}
+        return name, info.get('sample_name'), info.get('droplet_number')
 
     def _capture_metadata(self) -> dict:
         """Stage / nanodrive position metadata for a spectrum capture.
@@ -698,7 +809,10 @@ class MainWindow(QMainWindow):
         in widefield the objective isn't over the sample, so focusing it makes
         no sense.
         """
-        base = self._af_registered and self._af_worker is None
+        acq_running = (self._acq_worker is not None
+                       and self._acq_worker.isRunning())
+        base = (self._af_registered and self._af_worker is None
+                and not acq_running)
         objective = self._coordinate_manager.current_view == CameraView.OBJECTIVE
         self._live_view.set_autofocus_enabled(base)
         self._spectrum_viewer.set_autofocus_enabled(base and objective)
@@ -725,6 +839,10 @@ class MainWindow(QMainWindow):
         """Launch an AutofocusWorker and wire its signals to the UI."""
         if self._af_worker is not None and self._af_worker.isRunning():
             return  # one scan at a time
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            self._status_widget.show_message(
+                "Autofocus unavailable during acquisition", 3000)
+            return
         if plot_stage:
             self._spectrum_viewer.clear_focus_plot(plot_stage)
         self._status_widget.set_progress(0, label)
@@ -740,7 +858,7 @@ class MainWindow(QMainWindow):
         def _done(success: bool, best_z: float):
             self._status_widget.set_progress(0, "")
             self._status_widget.show_message(
-                f"{label} complete — best Z = {best_z:.3f}" if success
+                f"{label} complete. Best Z = {best_z:.3f}" if success
                 else f"{label} stopped", 5000)
             if success and focus_kind:
                 self._stage_control.set_focus_result(focus_kind, best_z)
@@ -774,9 +892,11 @@ class MainWindow(QMainWindow):
             return (AutofocusEngine.calculate_tenengrad(frame)
                     if frame is not None else 0.0)
 
-        # Let stage vibration settle before grabbing the frame to score.
-        self._start_af(positions, move, score, settle=0.5, label="Camera AF",
-                       maximize=True, focus_kind='cam_prusa')
+        # Let stage vibration settle before grabbing the frame to score (the
+        # Prusa Z step shakes the stage; too short and a blurry frame is scored).
+        self._start_af(positions, move, score,
+                       settle=self._config.widefield_camera.af_settle_time,
+                       label="Camera AF", maximize=True, focus_kind='cam_prusa')
 
     def _on_prusa_autofocus(self, params: dict):
         """Spectrometer coarse autofocus: step the Prusa Z, maximise signal."""
@@ -851,24 +971,26 @@ class MainWindow(QMainWindow):
         return _restore
 
     def _spectrum_focus_score(self, reps: int, expo_ms: float) -> float:
-        """Median of `reps` spectra (cosmic-ray rejection) → noodlepy ratio.
+        """Median of `reps` FRESH spectra (cosmic-ray rejection) → noodlepy
+        ratio. Lower is better (the scan minimises).
 
-        Runs inside the autofocus worker thread; uses only thread-safe
-        accessors on the spectrum thread. Lower is better (the scan minimises).
+        Uses the spectrometer thread's coordinated capture (acquire_frames) so
+        every score is taken AFTER the stage/NanoDrive move has settled and AT
+        the current integration time. Reading the cached free-running frame
+        instead would score stale spectra (captured before the move / at the
+        old exposure), which made repeated autofocus runs give alternating,
+        unreliable best-Z results.
         """
-        dt = max(0.03, expo_ms / 1000.0)
-        time.sleep(dt)  # let a fresh spectrum acquire after the move
-        specs = []
-        for _ in range(max(1, reps)):
-            s = self._spectrometer.get_latest_spectrum()
-            if s is not None:
-                specs.append(np.asarray(s, dtype=float))
-            time.sleep(dt)
-        if not specs:
+        spec = self._spectrometer
+        frames = spec.acquire_frames(max(1, reps))
+        if frames is None or not len(frames):
             return float('inf')  # worst score for a minimised metric
-        median = np.median(np.array(specs), axis=0)
-        wl_nm = self._spectrometer.wavelengths_nm
-        return AutofocusEngine.calculate_ratio_score(wl_nm, median)
+        median = np.median(frames, axis=0)
+        wl_nm = spec.wavelengths_nm
+        try:
+            return float(AutofocusEngine.calculate_ratio_score(wl_nm, median))
+        except Exception:  # noqa: BLE001
+            return float('inf')
 
     def _on_ranges_registered(self):
         """Autofocus ranges were registered — unlock the autofocus buttons."""
@@ -879,11 +1001,391 @@ class MainWindow(QMainWindow):
         # Unlock "Switch to Objective" now that a focus range is known.
         self._live_view.set_autofocus_registered(True)
         self._status_widget.show_message(
-            f"Autofocus ranges registered — WF Z {wf_lo}–{wf_up} mm, "
-            f"Obj Z {obj_lo}–{obj_up} mm", 4000)
+            f"Autofocus ranges registered. WF Z {wf_lo} to {wf_up} mm, "
+            f"Obj Z {obj_lo} to {obj_up} mm", 4000)
         logger.info(
             f"Autofocus ranges registered: WF Z [{wf_lo}, {wf_up}], "
             f"Obj Z [{obj_lo}, {obj_up}]")
+
+    def _on_registration_reset(self):
+        """Autofocus ranges were invalidated (disconnect) — re-lock the buttons
+        they gate so the user must register again. 'Switch to Objective' and the
+        camera autofocus stay disabled until then."""
+        self._af_registered = False
+        self._update_af_buttons()
+        self._live_view.set_autofocus_registered(False)
+        logger.info("Autofocus ranges reset (must re-register after reconnect)")
+
+    # --- Current-FoV acquisition --------------------------------------------
+    def _disconnected_acquisition_devices(self) -> list:
+        """Names of acquisition devices whose REAL connection is currently down.
+
+        Checks the live hardware state of each device (not the cached Connect
+        button flag), so a device that never connected or dropped out is caught
+        before a run starts. Simulated devices report connected, so this does not
+        block simulation runs."""
+        devices = [
+            ("Stage", self._motion_thread),
+            ("Widefield camera", self._widefield_camera),
+            ("Objective camera", self._objective_camera),
+            ("Spectrometer", self._spectrometer),
+            ("NanoDrive", self._nanodrive),
+        ]
+        return [name for name, dev in devices
+                if dev is None or not getattr(dev, 'is_connected', False)]
+
+    def _warn_if_devices_disconnected(self) -> bool:
+        """Pop up a warning listing any disconnected acquisition device. Returns
+        True if the caller should abort the start (something is disconnected),
+        False when every device is connected."""
+        missing = self._disconnected_acquisition_devices()
+        if not missing:
+            return False
+        QMessageBox.warning(
+            self,
+            "Devices not connected",
+            "Cannot start acquisition. The following device(s) are not "
+            "connected:\n\n  •  " + "\n  •  ".join(missing) +
+            "\n\nClick Connect and make sure every device is connected (and "
+            "the stage referenced) before starting acquisition.")
+        logger.warning(f"Acquisition blocked, disconnected devices: {missing}")
+        return True
+
+    def _on_start_current_fov(self, params: dict):
+        """Build and start the Current-FoV acquisition worker over the points
+        generated on the captured image."""
+        def _bail(msg: str):
+            # Surface the reason both ways: a transient status-bar message AND a
+            # log line (so it isn't missed if the status bar has already faded).
+            logger.warning(f"Current FoV not started: {msg}")
+            self._status_widget.show_message(msg, 5000)
+
+        logger.info("Current FoV start requested")
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            _bail("Acquisition already running")
+            return
+        if self._af_worker is not None and self._af_worker.isRunning():
+            _bail("Finish the autofocus scan first")
+            return
+
+        points = list(getattr(self._live_view, '_generated_positions', []) or [])
+        if not points:
+            _bail("No sample points generated (capture → segment → generate "
+                  "in the Live tab)")
+            return
+        # Verify every device is really connected (pops up a warning if not).
+        if self._warn_if_devices_disconnected():
+            return
+        if not self._motion_thread.all_referenced:
+            _bail("Stage not referenced (home/reference all axes first)")
+            return
+
+        cm = self._coordinate_manager
+        # Stage limit getters return (upper, lower); the worker wants (lower, upper).
+        wf_up, wf_lo = self._stage_control.get_widefield_z_limits()
+        obj_up, obj_lo = self._stage_control.get_objective_z_limits()
+        nano_up, nano_lo = self._stage_control.get_nanodrive_limits()
+
+        ctx = AcquisitionContext(
+            motion=self._motion_thread,
+            spectrometer=self._spectrometer,
+            nanodrive=self._nanodrive,
+            frame_provider=self._live_view.current_frame,
+            position_provider=lambda: self._current_position,
+            wavelengths_nm_provider=lambda: self._spectrometer.wavelengths_nm,
+            offset=(cm.offset_x, cm.offset_y, cm.offset_z),
+            excitation_nm=self._config.spectrometer.excitation_wavelength_nm,
+            wf_prusa_range=(wf_lo, wf_up),
+            obj_prusa_range=(obj_lo, obj_up),
+            nano_range=(nano_lo, nano_up),
+            af_settle_s=self._config.widefield_camera.af_settle_time,
+            af_capture_stabilization_s=(
+                self._config.widefield_camera.af_capture_stabilization_time),
+            # The Live tab's captured image + mask, saved once for this sample.
+            # The points (self._points above) already include any manually added
+            # ones, so the saved overlay shows them too.
+            capture_image=getattr(self._live_view, '_captured_image', None),
+            capture_mask=getattr(self._live_view, '_current_mask', None),
+            # Current FoV file names drop sample/droplet/position (start at the
+            # pattern), so no droplet identity is passed here.
+        )
+
+        worker = AcquisitionWorker(ctx, points, params)
+        worker.progress.connect(self._protocol_panel.on_acquisition_progress)
+        worker.status.connect(self._protocol_panel.on_acquisition_status)
+        worker.status.connect(lambda m: self._status_widget.show_message(m, 3000))
+        worker.error.connect(self._on_acq_error)
+        worker.view_changed.connect(self._on_acq_view_changed)
+        worker.finished_acq.connect(self._on_acq_finished)
+        # Stream the per-point autofocus scores to the Live-tab focus plot,
+        # just like the interactive spectrometer autofocus does.
+        worker.focus_started.connect(self._spectrum_viewer.clear_focus_plot)
+        worker.focus_point.connect(self._spectrum_viewer.add_focus_point)
+        # Let the worker drive the illumination LED (on for widefield autofocus,
+        # off afterwards) through the LED control widget so the button stays in
+        # sync. Queued because the worker lives on its own thread.
+        worker.led_set.connect(self._led_control.set_on)
+        self._acq_worker = worker
+        self._protocol_panel.on_acquisition_started()
+        # Lock the UI (everything but Pause/Stop) for the duration of the run.
+        self._set_ui_locked(True)
+        self._status_widget.show_message(
+            f"Current FoV acquisition: {len(points)} points", 4000)
+        logger.info(f"Starting Current-FoV acquisition over {len(points)} points")
+        worker.start()
+
+    def _on_start_robotic(self, params: dict):
+        """Build and start the Robotic Deposition worker over the selected
+        droplets. Each droplet is driven to, imaged + segmented, and its pattern
+        generated + measured at run time (see RoboticDepositionWorker)."""
+        def _bail(msg: str):
+            logger.warning(f"Robotic Deposition not started: {msg}")
+            self._status_widget.show_message(msg, 5000)
+
+        logger.info("Robotic Deposition start requested")
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            _bail("Acquisition already running")
+            return
+        if self._af_worker is not None and self._af_worker.isRunning():
+            _bail("Finish the autofocus scan first")
+            return
+
+        droplets = params.get('droplets') or []
+        if not droplets:
+            _bail("No droplets selected")
+            return
+        # Verify every device is really connected (pops up a warning if not).
+        if self._warn_if_devices_disconnected():
+            return
+        if not self._motion_thread.all_referenced:
+            _bail("Stage not referenced (home/reference all axes first)")
+            return
+
+        # Each selected well -> its LOGICAL widefield stage XY (no objective
+        # offset; the worker moves in widefield view and the per-point objective
+        # offset is applied in _measure_point). Same formula as the well-move.
+        from raman_control.gui.widgets.sample_grid import well_name
+        drop_cfg = self._config.sample_drop
+        stage_cfg = self._config.stage
+        wells = []
+        for (row, col) in droplets:
+            lx = (stage_cfg.home_x + drop_cfg.offset_home_to_a1_x
+                  + row * drop_cfg.well_pitch_mm)
+            ly = (stage_cfg.home_y + drop_cfg.offset_home_to_a1_y
+                  + col * drop_cfg.well_pitch_mm)
+            wells.append((well_name(row, col), lx, ly))
+
+        # Ensure the U-Net is loaded and snapshot the Live-tab pattern settings
+        # on the GUI thread; the worker then segments + generates off-thread.
+        self._status_widget.show_message("Preparing segmentation model…", 3000)
+        try:
+            segmenter = self._live_view.get_segmenter()
+        except Exception as e:  # noqa: BLE001
+            _bail(f"Could not load segmentation model: {e}")
+            return
+        pattern_settings = self._live_view.snapshot_pattern_settings()
+
+        cm = self._coordinate_manager
+        wf_up, wf_lo = self._stage_control.get_widefield_z_limits()
+        obj_up, obj_lo = self._stage_control.get_objective_z_limits()
+        nano_up, nano_lo = self._stage_control.get_nanodrive_limits()
+
+        ctx = AcquisitionContext(
+            motion=self._motion_thread,
+            spectrometer=self._spectrometer,
+            nanodrive=self._nanodrive,
+            # Segmentation + widefield AF must always read the WIDEFIELD camera,
+            # independent of which view the display happens to be showing (the
+            # worker toggles views per droplet), so read that thread directly.
+            frame_provider=self._widefield_camera.get_latest_frame,
+            position_provider=lambda: self._current_position,
+            wavelengths_nm_provider=lambda: self._spectrometer.wavelengths_nm,
+            offset=(cm.offset_x, cm.offset_y, cm.offset_z),
+            excitation_nm=self._config.spectrometer.excitation_wavelength_nm,
+            wf_prusa_range=(wf_lo, wf_up),
+            obj_prusa_range=(obj_lo, obj_up),
+            nano_range=(nano_lo, nano_up),
+            af_settle_s=self._config.widefield_camera.af_settle_time,
+            af_capture_stabilization_s=(
+                self._config.widefield_camera.af_capture_stabilization_time),
+            segmenter=segmenter,
+            pattern_settings=pattern_settings,
+            # Per-droplet sample name + number for the structured file names
+            # (the worker also uses each droplet's well as its position).
+            droplet_map=self._sample_grid.droplet_map(),
+        )
+
+        worker = RoboticDepositionWorker(ctx, wells, params)
+        worker.progress.connect(self._protocol_panel.on_acquisition_progress)
+        worker.status.connect(self._protocol_panel.on_acquisition_status)
+        worker.status.connect(lambda m: self._status_widget.show_message(m, 3000))
+        worker.error.connect(self._on_acq_error)
+        worker.view_changed.connect(self._on_acq_view_changed)
+        worker.finished_acq.connect(self._on_acq_finished)
+        worker.focus_started.connect(self._spectrum_viewer.clear_focus_plot)
+        worker.focus_point.connect(self._spectrum_viewer.add_focus_point)
+        worker.led_set.connect(self._led_control.set_on)
+        # Show each droplet's captured image + segmentation + points as the robot
+        # processes it, so it's clear the run moves between distinct droplets.
+        worker.droplet_segmented.connect(self._on_droplet_segmented)
+        self._acq_worker = worker
+        self._protocol_panel.on_acquisition_started()
+        self._set_ui_locked(True)
+        self._status_widget.show_message(
+            f"Robotic Deposition: {len(wells)} droplets", 4000)
+        logger.info(f"Starting Robotic Deposition over {len(wells)} droplets")
+        worker.start()
+
+    def _on_droplet_segmented(self, payload: dict):
+        """Show the droplet the Robotic Deposition worker just imaged + segmented
+        on the captured-image preview (Live tab) and the Current-FoV preview
+        (Auto Acquisition tab), so the per-droplet progress is visible."""
+        self._live_view.show_external_capture(
+            payload.get('image'),
+            payload.get('mask'),
+            payload.get('positions') or [],
+            payload.get('capture_xyz') or (0.0, 0.0, 0.0),
+        )
+
+    def _acq_running(self) -> bool:
+        """True while a Current-FoV acquisition worker is active."""
+        return self._acq_worker is not None and self._acq_worker.isRunning()
+
+    def _set_ui_locked(self, locked: bool):
+        """Lock the UI during an acquisition: every button / entry box / slider /
+        combo is disabled EXCEPT Pause and Stop. Display widgets (camera views,
+        spectrum & focus plots, the droplet map) are NOT disabled, so they keep
+        updating live. The previous enabled-state is snapshotted and restored on
+        unlock, so controls that were already disabled (e.g. gated autofocus
+        buttons) stay disabled afterwards."""
+        from PyQt6.QtWidgets import (
+            QAbstractButton, QAbstractSpinBox, QSlider, QLineEdit, QComboBox)
+        input_types = (QAbstractButton, QAbstractSpinBox, QSlider,
+                       QLineEdit, QComboBox)
+        pnl = self._protocol_panel
+        # The panel owns Start/Pause/Stop via on_acquisition_started/finished.
+        # The laser on/off button stays usable during a run (safety: the user
+        # must always be able to kill the laser).
+        owned = {getattr(pnl, '_start_btn', None),
+                 getattr(pnl, '_pause_btn', None),
+                 getattr(pnl, '_stop_btn', None),
+                 getattr(self._spectrum_viewer, '_laser_btn', None)}
+
+        from PyQt6.QtCore import Qt
+        if locked:
+            self._ui_lock_snapshot = {}
+            for w in self.findChildren(QWidget):
+                if w in owned or not isinstance(w, input_types):
+                    continue
+                # Snapshot the widget's OWN enabled intent, not isEnabled()
+                # (which is False whenever an ancestor group is disabled). A
+                # view-gated control inside a group the run disables (e.g. the
+                # pattern entry boxes when the run switches to objective view)
+                # must be restored to its own state so it re-enables once its
+                # group is re-enabled — otherwise it stays stuck disabled.
+                own_enabled = not w.testAttribute(
+                    Qt.WidgetAttribute.WA_ForceDisabled)
+                self._ui_lock_snapshot[w] = own_enabled
+                w.setEnabled(False)
+        else:
+            for w, enabled in self._ui_lock_snapshot.items():
+                try:
+                    w.setEnabled(enabled)
+                except RuntimeError:
+                    pass  # widget was deleted
+            self._ui_lock_snapshot = {}
+
+    def _on_acq_pause(self):
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            self._acq_worker.pause()
+            self._protocol_panel.on_acquisition_paused(True)
+            self._status_widget.show_message("Acquisition paused", 3000)
+
+    def _on_acq_resume(self):
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            self._acq_worker.resume()
+            self._protocol_panel.on_acquisition_paused(False)
+            self._status_widget.show_message("Acquisition resumed", 3000)
+
+    def _on_acq_stop(self):
+        if self._acq_worker is not None and self._acq_worker.isRunning():
+            self._acq_worker.abort()
+            self._status_widget.show_message("Stopping acquisition…", 3000)
+
+    def _on_acq_error(self, message: str):
+        logger.error(f"Acquisition: {message}")
+        self._status_widget.show_message(f"⚠ {message}", 5000)
+
+    def _on_acq_view_changed(self, view: str):
+        """The worker switched the active optical path. Update the coordinate
+        manager, stage panel and displayed camera on the GUI thread (the worker
+        has already moved the stage)."""
+        target = CameraView.OBJECTIVE if view == 'objective' else CameraView.WIDE_FOV
+        if self._coordinate_manager.current_view != target:
+            self._coordinate_manager.switch_view(target)
+            # The UI is locked during a run, so don't re-enable stage / AF
+            # controls here; they're re-synced to the final view on finish.
+            if not (self._acq_worker is not None and self._acq_worker.isRunning()):
+                self._stage_control.on_camera_view_changed()
+                self._update_af_buttons()
+        self._live_view.switch_camera('objective' if view == 'objective' else 'wide')
+
+    def _on_acq_finished(self, aborted: bool, n_saved: int):
+        self._protocol_panel.on_acquisition_finished(aborted)
+        # Re-enable the UI that was locked for the run.
+        self._set_ui_locked(False)
+        # Let the worker's run() fully return before dropping our reference, so
+        # the QThread object isn't garbage-collected while the thread is still
+        # running (which would crash with "QThread: Destroyed while running").
+        worker = self._acq_worker
+        self._acq_worker = None
+        if worker is not None:
+            worker.wait(5000)
+        # The run leaves the system in objective view, where the Live tab's
+        # capture / segmentation / pattern controls (and their entry boxes) are
+        # greyed out. Return to widefield so they're usable again.
+        #
+        # First try the proper offset move-back (same as the camera-switch
+        # button). NOTE: that path REFUSES to switch if its safety check fails
+        # (e.g. the stage is in a bad state after a stop / brown-out), which
+        # would strand the Live controls disabled. So afterwards we GUARANTEE the
+        # Live tab ends in a usable widefield state: if the display isn't already
+        # wide, force the view bookkeeping + display to widefield (display-only,
+        # no move) so the controls are re-enabled regardless.
+        if self._coordinate_manager.current_view != CameraView.WIDE_FOV:
+            self._on_camera_switch_requested('wide')
+        if self._live_view.current_camera != 'wide':
+            logger.warning("Return-to-widefield move was blocked; forcing the "
+                           "Live view to widefield so its controls are usable.")
+            if self._coordinate_manager.current_view != CameraView.WIDE_FOV:
+                self._coordinate_manager.switch_view(CameraView.WIDE_FOV)
+            self._live_view.switch_camera('wide')
+        # Re-sync stage-panel Z-box editability and AF buttons to the final view.
+        self._stage_control.on_camera_view_changed()
+        self._update_af_buttons()
+
+        # Current FoV: return the stage to the captured-image center (where it
+        # started) so it doesn't end parked on the last measured point. Done
+        # AFTER the switch back to widefield (the capture position is a widefield
+        # position). Skipped on abort/stop, where the user likely stopped to
+        # inspect the current spot. Robotic Deposition has no single capture, so
+        # it is skipped there too.
+        if (not aborted and worker is not None
+                and not isinstance(worker, RoboticDepositionWorker)
+                and getattr(self._live_view, '_captured_image', None) is not None):
+            cap_pos = getattr(self._live_view, '_capture_stage_position', None)
+            if (cap_pos and self._coordinate_manager.current_view == CameraView.WIDE_FOV
+                    and self._motion_thread and self._motion_thread.is_connected):
+                self._motion_thread.request_move_to(
+                    x=cap_pos[0], y=cap_pos[1], z=cap_pos[2])
+                logger.info(
+                    "Current FoV: returning stage to capture center "
+                    f"({cap_pos[0]:.3f}, {cap_pos[1]:.3f}, {cap_pos[2]:.3f})")
+
+        msg = (f"Acquisition stopped ({n_saved} spectra saved)" if aborted
+               else f"Acquisition complete: {n_saved} spectra saved")
+        self._status_widget.show_message(msg, 6000)
+        logger.info(msg)
 
     def _on_positions_generated(self, positions: list):
         """Handle sample positions from live view segmentation.
@@ -916,6 +1418,11 @@ class MainWindow(QMainWindow):
         placed over the same sample point. Z is left at the current value
         (XY-only move, matching well selection).
         """
+        if self._acq_running():
+            msg = "Move-to-point is disabled during acquisition"
+            logger.info(msg)
+            self._status_widget.show_message(msg, 3000)
+            return
         if not self._motion_thread or not self._motion_thread.is_connected:
             self._status_widget.show_message("Stage not connected", 3000)
             return
@@ -945,6 +1452,11 @@ class MainWindow(QMainWindow):
         using ``logical_to_physical`` which accounts for the current
         camera view (wide FOV vs objective offset).
         """
+        if self._acq_running():
+            msg = "Well move is disabled during acquisition"
+            logger.info(msg)
+            self._status_widget.show_message(msg, 3000)
+            return
         if not self._motion_thread or not self._motion_thread.is_connected:
             self._status_widget.show_message("Stage not connected", 3000)
             return
@@ -1030,28 +1542,63 @@ class MainWindow(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            logger.info("Closing...")
-            if self._af_worker is not None and self._af_worker.isRunning():
-                self._af_worker.abort()
-                self._af_worker.wait(2000)
-            for thread in [self._motion_thread, self._widefield_camera,
-                           self._objective_camera, self._spectrometer,
-                           self._led_thread]:
-                if thread and thread.isRunning():
+            self._shutdown_hardware()
+            event.accept()
+        else:
+            event.ignore()
+
+    def _shutdown_hardware(self):
+        """Disconnect all hardware cleanly on exit. Idempotent and
+        error-isolated: each device is shut down in its own try/except so one
+        failure can't skip the rest — in particular the LED serial port MUST be
+        closed gracefully every time, or the CH340 comes back in the Windows
+        'device not functioning' state and needs a physical re-plug.
+
+        Called from closeEvent and (as a backstop) from QApplication.aboutToQuit.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        logger.info("Closing, shutting down hardware...")
+
+        # Stop the acquisition / autofocus workers first.
+        for worker, wait_ms in ((self._acq_worker, 5000),
+                                (self._af_worker, 2000)):
+            try:
+                if worker is not None and worker.isRunning():
+                    worker.abort()
+                    worker.wait(wait_ms)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Worker shutdown error: {e}")
+
+        # Stop each hardware thread independently so one hang/error can't
+        # prevent the others (notably the LED) from closing cleanly.
+        for thread in (self._motion_thread, self._widefield_camera,
+                       self._objective_camera, self._spectrometer,
+                       self._led_thread):
+            try:
+                if thread is not None and thread.isRunning():
                     thread.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Thread shutdown error: {e}")
+
+        try:
             if self._nanodrive and self._nanodrive.is_connected:
                 self._nanodrive.disconnect()
-            # Dispose the shared Thorlabs SDK exactly once, now that all
-            # camera threads have stopped and the process is exiting. The
-            # SDK is kept alive across reconnects, so this is the only
-            # place it gets torn down.
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"NanoDrive shutdown error: {e}")
+
+        # Dispose the shared Thorlabs SDK exactly once, now that all camera
+        # threads have stopped and the process is exiting.
+        try:
             from raman_control.gui.threads.camera_thread import (
                 ThorlabsCameraManager,
             )
             ThorlabsCameraManager.get_instance().dispose()
-            event.accept()
-        else:
-            event.ignore()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Camera SDK dispose error: {e}")
+
+        logger.info("Hardware shutdown complete")
 
 
 def main():
@@ -1061,8 +1608,12 @@ def main():
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
+    # Tooltips (button / entry-box / label hints) should appear almost
+    # immediately on hover instead of after Qt's ~700 ms default.
+    install_fast_tooltips(app)
+
     # Block the mouse wheel from changing spin box / combo box values
-    # anywhere in the app — values must be typed or set via the arrows.
+    # anywhere in the app, values must be typed or set via the arrows.
     install_wheel_guard(app)
 
     config = HardwareConfig()

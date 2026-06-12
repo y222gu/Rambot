@@ -19,6 +19,8 @@ Adapted from the noodlepy ``LEDController`` with three changes for this system:
     close lets the driver release the port so the next launch reopens it.
 """
 
+import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -107,8 +109,34 @@ class LEDController:
         if not port:
             return False
 
+        if self._open_with_retries(port):
+            return True
+
+        # Persistent failure — the CH340 is most likely stuck in the Windows
+        # "device not functioning" (error 31) state from a previous unclean
+        # exit (e.g. a crash). Retrying the open can't clear that; the only
+        # software way is to re-enumerate the USB device (the OS equivalent of
+        # a physical re-plug). Try that once, then reopen.
+        logger.warning(
+            f"LED port {port} won't open, attempting to reset the device…")
+        if self._attempt_port_recovery(port):
+            time.sleep(2.0)  # let the device re-enumerate and re-create the port
+            if self._open_with_retries(port, attempts=2):
+                return True
+
+        logger.error(
+            f"Could not open LED port {port}. If this keeps happening, run the "
+            f"app as administrator (so it can reset the device automatically) "
+            f"or physically re-plug the LED once.")
+        self._serial = None
+        return False
+
+    def _open_with_retries(self, port: str, attempts: Optional[int] = None) -> bool:
+        """Try to open + configure the port a few times. Returns True on
+        success (and sets self._serial), False if all attempts failed."""
+        attempts = attempts or self._OPEN_ATTEMPTS
         last_err: Optional[Exception] = None
-        for attempt in range(1, self._OPEN_ATTEMPTS + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 # DTR asserted on open (pyserial default) -> resets the Arduino.
                 ser = serial.Serial(
@@ -118,9 +146,9 @@ class LEDController:
             except (serial.SerialException, OSError) as e:
                 last_err = e
                 logger.warning(
-                    f"LED open attempt {attempt}/{self._OPEN_ATTEMPTS} on "
+                    f"LED open attempt {attempt}/{attempts} on "
                     f"{port} failed: {e}")
-                if attempt < self._OPEN_ATTEMPTS:
+                if attempt < attempts:
                     time.sleep(self._OPEN_RETRY_DELAY)
                 continue
 
@@ -136,11 +164,48 @@ class LEDController:
             logger.info(f"LED controller connected on {port}")
             return True
 
-        logger.error(
-            f"Failed to open LED serial port {port} after "
-            f"{self._OPEN_ATTEMPTS} attempts: {last_err}")
-        self._serial = None
+        if last_err is not None:
+            logger.warning(
+                f"LED port {port} did not open after {attempts} attempts: "
+                f"{last_err}")
         return False
+
+    def _attempt_port_recovery(self, port: str) -> bool:
+        """Re-enumerate (disable + re-enable) the USB-serial device backing
+        ``port`` — the software equivalent of a physical re-plug — to clear a
+        CH340 stuck in the 'device not functioning' (error 31) state.
+
+        Windows-only, best effort. ``Restart-PnpDevice`` usually needs
+        administrator rights, so this is wrapped in try/except and simply
+        returns False (with a hint logged) when it can't run."""
+        if sys.platform != 'win32':
+            return False
+        # Plain (non-f) string so the PowerShell braces are literal; the port
+        # is concatenated in.
+        ps = (
+            "$ErrorActionPreference='Stop'; "
+            "$d = Get-PnpDevice -PresentOnly | "
+            "Where-Object { $_.FriendlyName -like '*(" + port + ")*' } | "
+            "Select-Object -First 1; "
+            "if (-not $d) { throw 'COM device not found' }; "
+            "Restart-PnpDevice -InstanceId $d.InstanceId -Confirm:$false"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                logger.info(f"Re-enumerated {port} (Restart-PnpDevice)")
+                return True
+            logger.warning(
+                f"Could not auto-reset {port} (likely needs admin): "
+                f"{(result.stderr or '').strip()[:200]}")
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Port recovery attempt for {port} failed: {e}")
+            return False
 
     def disconnect(self) -> None:
         """Close the serial port GRACEFULLY so the CH340 stays reopenable.
@@ -158,14 +223,28 @@ class LEDController:
             return
         try:
             if ser.is_open:
-                # Best-effort: turn the strip off before releasing the port.
+                # Best-effort: turn the strip off, and make sure the byte is
+                # actually transmitted before we release the port.
                 try:
                     ser.write(b'0\n')
+                    ser.flush()              # block until the OFF byte is sent
+                    time.sleep(0.05)
                 except Exception:  # noqa: BLE001
                     pass
+                # Clear any pending I/O so close() doesn't block / leave bytes
+                # stuck in the driver.
+                for reset in (ser.reset_output_buffer, ser.reset_input_buffer):
+                    try:
+                        reset()
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Drop the control lines and give the driver a moment to apply
+                # the change before closing — this is what lets the CH340
+                # release the port so the next launch can reopen it.
                 try:
                     ser.dtr = False
                     ser.rts = False
+                    time.sleep(0.05)
                 except Exception:  # noqa: BLE001
                     pass
                 ser.close()

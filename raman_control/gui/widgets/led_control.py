@@ -90,15 +90,19 @@ class LEDControlWidget(QWidget):
                 QPushButton:hover {{ background-color: {COLORS['accent_hover']}; }}
             ''')
         else:
-            self._toggle_btn.setStyleSheet(f'''
-                QPushButton {{
+            # Off: cyan-outline look matching the Settings button.
+            self._toggle_btn.setStyleSheet('''
+                QPushButton {
                     background-color: transparent;
-                    border: 1px solid #4d4d4d;
-                    border-radius: 4px;
-                    color: {COLORS['text_primary']};
+                    border: 2px solid #00b4b4;
+                    border-radius: 6px;
+                    font-weight: bold;
+                    color: #00b4b4;
                     padding: 4px 6px;
-                }}
-                QPushButton:hover {{ border-color: {COLORS['accent_primary']}; }}
+                }
+                QPushButton:hover { background-color: #2a3a3a;
+                    border-color: #00d4d4; color: #00d4d4; }
+                QPushButton:pressed { background-color: #1a3030; }
             ''')
 
     def _update_pct(self, value: int) -> None:
@@ -109,13 +113,25 @@ class LEDControlWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_toggle(self) -> None:
-        self._is_on = self._toggle_btn.isChecked()
-        if self._is_on:
+        self.set_on(self._toggle_btn.isChecked())
+
+    def set_on(self, on: bool) -> None:
+        """Turn the LED on/off and keep the button/slider/hardware in sync.
+
+        Public so other parts of the app can drive the light without a click —
+        e.g. the acquisition worker illuminates the sample for the widefield
+        autofocus (via a queued signal) and turns it back off afterwards. Safe
+        to call from the GUI thread only.
+        """
+        self._is_on = bool(on)
+        if on:
             brightness = self._slider.value() or self._default_brightness
             if not self._slider.value():
                 self._slider.setValue(brightness)  # reflect the fallback level
+            self._toggle_btn.setChecked(True)
             self._led.request_on(brightness)
         else:
+            self._toggle_btn.setChecked(False)
             self._led.request_off()
         self._refresh_button()
 
@@ -135,7 +151,11 @@ class LEDControlWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_connected(self, port: str) -> None:
-        self._toggle_btn.setToolTip(f"Illumination LED — connected on {port}")
+        self._toggle_btn.setToolTip(f"Illumination LED: connected on {port}")
+        # Auto-on once the board connects (e.g. at startup) so the sample is lit
+        # without an extra click.
+        if not self._is_on:
+            self.set_on(True)
 
     def _on_error(self, message: str) -> None:
-        self._toggle_btn.setToolTip(f"Illumination LED — {message}")
+        self._toggle_btn.setToolTip(f"Illumination LED: {message}")

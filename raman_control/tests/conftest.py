@@ -42,7 +42,7 @@ def pytest_collection_modifyitems(config, items):
     if config.getoption("--run-hardware"):
         return
     skip_hardware = pytest.mark.skip(
-        reason="hardware test — skipped by default (pass --run-hardware to "
+        reason="hardware test, skipped by default (pass --run-hardware to "
                "run; this MOVES the stage)"
     )
     for item in items:

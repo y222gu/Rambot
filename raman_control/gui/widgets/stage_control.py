@@ -79,7 +79,7 @@ def _btn_style(size: str) -> str:
         QPushButton:disabled {{ color: #505050; background-color: #2a2a2a; }}
     '''
 
-_STEP_LABEL_STYLE = 'color: #606060; font-size: 9px;'
+_STEP_LABEL_STYLE = 'color: #ffffff; font-size: 12px;'
 
 
 class DirectionPad(QWidget):
@@ -132,9 +132,8 @@ class DirectionPad(QWidget):
             btn.setEnabled(False)
             btn.clicked.connect(lambda _, s=size: self._emit_move(0, -self._step_sizes[s]))
             layout.addWidget(btn, 4 + i, 3, Qt.AlignmentFlag.AlignCenter)
-            lbl = QLabel(str(self._step_sizes[size]))
-            lbl.setStyleSheet(_STEP_LABEL_STYLE)
-            layout.addWidget(lbl, 4 + i, 4)
+            # No step label here — the 3 Y+ labels (col 2) already cover the Y
+            # axis; the other set of 3 now labels the X axis (on the X+ buttons).
             setattr(self, f'btn_y_minus_{size}', btn)
 
         # X- buttons (left, large=far, small=near) — cols 0,1,2
@@ -155,12 +154,18 @@ class DirectionPad(QWidget):
             btn.setEnabled(False)
             btn.clicked.connect(lambda _, s=size: self._emit_move(self._step_sizes[s], 0))
             layout.addWidget(btn, 3, 4 + i, Qt.AlignmentFlag.AlignCenter)
+            # X-axis step label above each X+ button (the set moved off Y).
+            lbl = QLabel(str(self._step_sizes[size]))
+            lbl.setStyleSheet(_STEP_LABEL_STYLE)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter
+                             | Qt.AlignmentFlag.AlignBottom)
+            layout.addWidget(lbl, 2, 4 + i)
             setattr(self, f'btn_x_plus_{size}', btn)
 
         # Center label — unit shown once here
         center = QLabel('XY\nmm')
         center.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.setStyleSheet('color: #808080; font-weight: bold; font-size: 14px;')
+        center.setStyleSheet('color: #ffffff; font-weight: bold; font-size: 14px;')
         layout.addWidget(center, 3, 3, Qt.AlignmentFlag.AlignCenter)
 
     def _emit_move(self, dx: float, dy: float):
@@ -218,7 +223,7 @@ class ZControlPad(QWidget):
         # Center label — unit shown once here
         center = QLabel(f'{self._label}\n{self._unit}')
         center.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        center.setStyleSheet('color: #808080; font-weight: bold; font-size: 14px;')
+        center.setStyleSheet('color: #ffffff; font-weight: bold; font-size: 14px;')
         layout.addWidget(center, row, 0, Qt.AlignmentFlag.AlignCenter)
         row += 1
 
@@ -257,11 +262,14 @@ class StageControlWidget(QWidget):
         ranges_registered: Emitted when autofocus ranges are registered. Read
             the values via get_widefield_z_limits / get_objective_z_limits /
             get_nanodrive_limits.
+        registration_reset: Emitted when a previously-registered autofocus range
+            is invalidated (e.g. on disconnect) and must be registered again.
     """
 
     position_updated = pyqtSignal(float, float, float)
     referenced_changed = pyqtSignal(dict)
     ranges_registered = pyqtSignal()
+    registration_reset = pyqtSignal()
 
     def __init__(
         self,
@@ -283,6 +291,8 @@ class StageControlWidget(QWidget):
         # Current state
         self._current_position = (0.0, 0.0, 0.0)
         self._nd_position = 0.0
+        # Autofocus Z ranges are only valid once the user presses Register.
+        self._ranges_registered = False
         self._referenced = {'X': False, 'Y': False, 'Z': False}
 
         # Build UI
@@ -333,6 +343,24 @@ class StageControlWidget(QWidget):
         ref_grid.addLayout(indicator_row, 0, 0)
 
         self._ref_all_btn = QPushButton("Reference All")
+        # Same solid-cyan style as Go Home (transparent outline when disabled).
+        self._ref_all_btn.setStyleSheet('''
+            QPushButton {
+                background-color: #00b4b4;
+                border: 1px solid #00d4d4;
+                border-radius: 5px;
+                color: #1a1a1a;
+                font-weight: 600;
+                padding: 4px 8px;
+            }
+            QPushButton:hover { background-color: #00d4d4; }
+            QPushButton:pressed { background-color: #008080; }
+            QPushButton:disabled {
+                background-color: transparent;
+                border: 1px solid #4d4d4d;
+                color: #505050;
+            }
+        ''')
         self._ref_all_btn.clicked.connect(self._on_ref_all_clicked)
         ref_grid.addWidget(self._ref_all_btn, 1, 0)
 
@@ -509,10 +537,13 @@ class StageControlWidget(QWidget):
             }
         ''')
         self._go_btn.clicked.connect(self._on_go_clicked)
-        pos_layout.addWidget(self._go_btn, 3, 1, 1, 4)
+        self._go_btn.setMinimumWidth(96)
+        # Sit to the RIGHT of the ND column, level with the Target entry row.
+        pos_layout.addWidget(self._go_btn, 2, 5)
+        pos_layout.setColumnStretch(5, 0)
 
-        # Spacer between button and speed slider
-        pos_layout.setRowMinimumHeight(4, 8)
+        # Spacer between the position rows and the speed slider
+        pos_layout.setRowMinimumHeight(3, 8)
 
         # Speed slider row
         speed_row = QHBoxLayout()
@@ -539,7 +570,7 @@ class StageControlWidget(QWidget):
         self._speed_label.setStyleSheet('color: #00b4b4;')
         speed_row.addWidget(self._speed_label)
 
-        pos_layout.addLayout(speed_row, 5, 0, 1, 5)
+        pos_layout.addLayout(speed_row, 4, 0, 1, 6)
 
         pos_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         main_layout.addWidget(pos_group)
@@ -654,12 +685,19 @@ class StageControlWidget(QWidget):
                 padding: 5px 10px;
             }}
             QPushButton:hover {{ background-color: {COLORS['accent_hover']}; }}
+            QPushButton:disabled {{
+                background-color: transparent;
+                border: 1px solid #4d4d4d;
+                color: #505050;
+            }}
         ''')
-        # Compact button (natural width) so the entry boxes have full room.
-        # Spans the full height (header + both limit rows), level with the
-        # focus-Z readouts to its right.
+        # Spans the two limit rows and FILLS them vertically (Expanding), so its
+        # top aligns with the Highest entry box and its bottom with the Lowest
+        # entry box.
+        self._register_btn.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                         QSizePolicy.Policy.Expanding)
         self._register_btn.clicked.connect(self._on_register_ranges)
-        limits_grid.addWidget(self._register_btn, 0, 4, 3, 1)
+        limits_grid.addWidget(self._register_btn, 1, 4, 2, 1)
 
         # Best-focus Z from each autofocus, stacked to the right of Register.
         focus_box = QVBoxLayout()
@@ -669,8 +707,8 @@ class StageControlWidget(QWidget):
         for kind, text in (('cam_prusa', 'Cam Prusa'),
                            ('spec_prusa', 'Spec Prusa'),
                            ('spec_nano', 'Spec ND')):
-            lbl = QLabel(f'{text}: N/A')
-            lbl.setStyleSheet(f'font-size: 10px; color: {COLORS["text_secondary"]};')
+            lbl = QLabel(f'{text} Focus: N/A')
+            lbl.setStyleSheet('font-size: 12px; color: #ffffff;')
             self._focus_lbls[kind] = (lbl, text)
             focus_box.addWidget(lbl)
         limits_grid.addLayout(focus_box, 0, 5, 3, 1)
@@ -727,7 +765,19 @@ class StageControlWidget(QWidget):
         self._referenced = {'X': False, 'Y': False, 'Z': False}
         for indicator in self._ref_indicators.values():
             indicator.set_active(False)
+        # The autofocus range is anchored to the (now-lost) home position, so it
+        # is invalidated too: the user must re-register after re-referencing.
+        was_registered = self._ranges_registered
+        self._ranges_registered = False
         self._update_button_states()
+        # The home reference is lost on disconnect — tell the rest of the GUI so
+        # reference-gated features (FOV switch, sample grid, move-to-point) lock
+        # again until the stage is re-referenced.
+        self.referenced_changed.emit(self._referenced)
+        if was_registered:
+            # Re-lock the autofocus-range-gated buttons (Switch to Objective,
+            # camera autofocus, acquisition Start) until re-registration.
+            self.registration_reset.emit()
 
     def _on_error(self, message: str):
         logger.error(f"Motion error: {message}")
@@ -854,6 +904,8 @@ class StageControlWidget(QWidget):
         self._home_btn.setEnabled(all_ref and connected)
         self._calibrate_home_btn.setEnabled(all_ref and connected)
         self._go_btn.setEnabled(all_ref and connected)
+        # Registering autofocus ranges needs a referenced stage.
+        self._register_btn.setEnabled(all_ref and connected)
 
         self._xy_pad.set_enabled(all_ref and connected)
         self._z_pad.set_enabled(all_ref and connected)
@@ -894,6 +946,7 @@ class StageControlWidget(QWidget):
         logger.info(f"Registered autofocus ranges: WF Z [{wf_lo}, {wf_up}] mm, "
                     f"Obj Z [{obj_lo}, {obj_up}] mm (offset {off_z}), "
                     f"NanoDrive [{n_lo}, {n_up}] um")
+        self._ranges_registered = True
         self.ranges_registered.emit()
 
     def _is_objective_view(self) -> bool:
@@ -912,6 +965,10 @@ class StageControlWidget(QWidget):
     def on_camera_view_changed(self):
         """Called by the main window when the camera view switches."""
         self._update_af_editability()
+
+    def is_registered(self) -> bool:
+        """True once the user has pressed Register (autofocus Z ranges valid)."""
+        return self._ranges_registered
 
     def get_widefield_z_limits(self) -> tuple:
         """Widefield Prusa Z autofocus limits (upper, lower) in mm."""
@@ -936,4 +993,4 @@ class StageControlWidget(QWidget):
             return
         lbl, text = entry
         unit = 'µm' if kind == 'spec_nano' else 'mm'
-        lbl.setText(f'{text}: {value:.3f} {unit}')
+        lbl.setText(f'{text} Focus: {value:.3f} {unit}')

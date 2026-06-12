@@ -117,6 +117,16 @@ class CameraConfig:
     # this many times (avoids an infinite loop).
     center_max_repeats: int = 3
 
+    # Camera-autofocus stabilization (seconds). Each Prusa Z step during the
+    # autofocus scan shakes the stage; wait this long after every step for the
+    # vibration to settle before scoring the (continuously acquired) camera
+    # frame, so a blurry mid-vibration frame is never scored. Raise this if the
+    # stage vibrates a lot. af_capture_stabilization_time is applied ONCE after
+    # the best focus is reached, before grabbing the frame used for
+    # segmentation, and is slightly longer so that capture is extra steady.
+    af_settle_time: float = 1.0
+    af_capture_stabilization_time: float = 1.5
+
 
 @dataclass
 class SpectrometerConfig:
@@ -140,7 +150,7 @@ class LEDConfig:
     baudrate: int = 9600
     timeout: float = 2.0     # seconds (serial read timeout)
     boot_delay: float = 2.0  # seconds to wait after open (Arduino resets)
-    default_brightness: int = 255  # 0-255, used when toggling on from 0
+    default_brightness: int = 128  # 0-255 (~50%), the initial/startup brightness
 
 
 @dataclass

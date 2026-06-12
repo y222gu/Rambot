@@ -127,6 +127,14 @@ QPushButton[primary="true"]:pressed {{
     background-color: {COLORS['accent_pressed']};
 }}
 
+/* Primary buttons must still look disabled when disabled (higher specificity
+   than the [primary] rule above, so it wins for the disabled state). */
+QPushButton[primary="true"]:disabled {{
+    background-color: transparent;
+    border: 1px solid #4d4d4d;
+    color: #505050;
+}}
+
 /* Danger buttons */
 QPushButton[danger="true"] {{
     background-color: {COLORS['error']};
@@ -136,6 +144,13 @@ QPushButton[danger="true"] {{
 
 QPushButton[danger="true"]:hover {{
     background-color: #ff5252;
+}}
+
+/* Danger buttons greyed out when disabled (e.g. Stop before a run starts). */
+QPushButton[danger="true"]:disabled {{
+    background-color: transparent;
+    border: 1px solid #4d4d4d;
+    color: #505050;
 }}
 
 /* Direction buttons (compact) */

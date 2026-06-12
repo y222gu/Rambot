@@ -91,7 +91,7 @@ class NanoPiezo(MotionDevice):
             # Initialize handle
             self._handle = self._dll.MCL_InitHandle()
             if self._handle == 0:
-                raise RuntimeError("MCL_InitHandle returned 0 – device not found")
+                raise RuntimeError("MCL_InitHandle returned 0, device not found")
 
             self.logger.info(f"MCL Handle = {self._handle}")
 
