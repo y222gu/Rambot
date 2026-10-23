@@ -67,6 +67,11 @@ class NanoPiezo(MotionDevice):
         return self._max_position
 
     @property
+    def initial_position(self) -> float:
+        """Configured start/park position in um (where ``home()`` moves to)."""
+        return self._config.initial_position
+
+    @property
     def is_simulated(self) -> bool:
         return self._simulated
 

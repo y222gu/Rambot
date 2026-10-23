@@ -64,9 +64,9 @@
 
 ### High Priority (Hardware Integration)
 1. **Connect real PRUSA stage** - Test `serial_protocol.py` with actual hardware
-2. **Thorlabs camera SDK** - Uncomment SDK calls in `camera_thread.py`, set `_simulated = False`
-3. **Wasatch spectrometer SDK** - Uncomment SDK calls in `spectrum_thread.py`, set `_simulated = False`
-4. **MadCity Labs piezo** - Test `nano_piezo.py` with real hardware
+2. ~~**Thorlabs camera SDK**~~ ✅ DONE (Session 6) - Real SDK integration with shared `ThorlabsCameraManager`
+3. ~~**Wasatch spectrometer SDK**~~ ✅ DONE (Session 8) - Real SDK integration with debug mode fallback
+4. ~~**MadCity Labs piezo**~~ ✅ DONE (Session 6) - Real ctypes DLL integration, hardware tested
 
 ### Medium Priority (Features)
 5. **Segmentation UI Panel** - Create GUI widget for segmentation module
@@ -88,6 +88,7 @@
 2. Primary refactoring priority: Serial communication timeout handling
 3. Thread architecture: One thread per hardware device, Qt signals for GUI updates
 4. Command queuing: All G-code via `Queue.Queue()` with dedicated worker threads
+5. Debug mode: Explicit opt-in simulation — production mode fails hard on missing hardware, debug mode falls back to simulation with visible "(SIM)" indicators
 
 ---
 
@@ -232,6 +233,27 @@ pip install -r raman_control/requirements.txt
 
 **Lesson**: Think about workflow - what panels does user look at together? Group related controls. Use space efficiently.
 
+### Issue 4: Camera Initialization Race & GUI Freeze on View Switch (FIXED)
+**Problem**: Both camera threads could not initialize simultaneously. Switching between wide FOV and objective views froze the GUI for seconds.
+
+**Root Causes**:
+1. No serialization of `_connect_camera()` across camera thread instances — SDK race condition
+2. `get_position()` called from GUI thread during switch — blocking serial I/O on main thread
+3. Only one camera acquired at a time — switch required stop/start dance with frame gap
+4. QMessageBox dialog on every switch to objective — unnecessary blocking
+
+**Fix**:
+- Added `_connect_lock` class-level lock to serialize camera connections
+- Added `_sdk_ref_held` flag to prevent incorrect SDK ref count decrement
+- Both cameras now auto-start acquisition on connect (always streaming simultaneously)
+- View switch is display-only — just changes which camera's frames are shown (matches old noodlepy pattern)
+- Used cached `_current_position` from `position_changed` signal instead of blocking `get_position()`
+- Stage offset movement dispatched via `request_move_to()` (fire-and-forget, non-blocking)
+- Removed QMessageBox from view switch
+- Added `np.ascontiguousarray()` to prevent SDK buffer reuse corruption
+
+**Lesson**: View switching should NEVER involve hardware I/O on the GUI thread. Both cameras must always stream. The old noodlepy code got this right — switching was just swapping which image queue the display widget reads from.
+
 ### Issue 1: `is_ready` property conflict (FIXED)
 **Error**: `AttributeError: property 'is_ready' of 'AcquisitionStateMachine' object has no setter`
 
@@ -314,13 +336,85 @@ pip install -r raman_control/requirements.txt
 - Tabs now: Live View, Spectrometer, Sample Grid, Protocol
 - Total lines of code reduced, better space utilization
 
+### Session 6 (2026-01-30 - HARDWARE INTEGRATION)
+- **CAMERA AND NANODRIVE HARDWARE FULLY CONNECTED**
+- Implemented `ThorlabsCameraManager` singleton in `camera_thread.py`:
+  - Single `TLCameraSDK` instance shared by both camera threads
+  - Ref-counted `initialize()` / `release()` with thread-safe locking
+  - `discover_available_cameras()` called once on init
+  - `open_camera(serial)` provides camera handles to individual threads
+- Camera thread now connects to real Thorlabs hardware:
+  - `configure_thorlabs_dll_path()` adds DLL dir to PATH + `os.add_dll_directory()`
+  - Widefield (serial 14938): BAYER sensor, color processing via `MonoToColorProcessorSDK`, output (1080, 1440) grayscale
+  - Objective (serial 14628): MONOCHROME sensor, bit-depth scaling, flip + rotate + crop → output (375, 500)
+  - Falls back to simulated mode if SDK unavailable or cameras not found
+- NanoPiezo now uses real ctypes DLL calls:
+  - `MCL_InitHandle()`, `MCL_SingleWriteN(c_double, c_uint axis=3, handle)`, `MCL_SingleReadN(c_uint axis=3, handle)`, `MCL_ReleaseHandle(handle)`
+  - 25ms stabilization time after writes
+  - Hardware tested: position reads, move_to, move_by all verified
+- Updated `hardware_config.py`:
+  - Camera serial numbers: widefield="14938", objective="14628"
+  - DLL paths: Thorlabs at `raman_control/dlls/64_lib/`, Madlib at `raman_control/dlls/Madlib.dll`
+  - Image transform settings for objective camera (flip, rotate, crop center 798x452, size 500x375)
+- Wired NanoDrive into `stage_control.py`:
+  - ND pad move_requested → `nanodrive.move_by(z=dz)`
+  - Ref NP button → `nanodrive.home()`
+  - Go button → also moves nanodrive to target value
+  - Position display updates from hardware reads
+- Updated `main_window.py`:
+  - Creates `NanoPiezo` instance with config
+  - Passes nanodrive to `StageControlWidget`
+  - Passes `dll_dir` to camera threads
+  - NanoDrive added to status bar, connect/disconnect lifecycle
+
 ### Hardware Integration Notes
-- Camera and spectrometer threads use `_simulated = True` flag
-- To connect real hardware, set `_simulated = False` and uncomment SDK calls
-- Thorlabs SDK: `thorlabs_tsi_sdk`
+- **Cameras**: Connected via real Thorlabs TSI SDK, falls back to simulated if SDK unavailable
+- **NanoDrive**: Connected via real Madlib.dll ctypes, falls back to simulated if DLL unavailable
+- **Spectrometer**: Still uses `_simulated = True` flag - needs Wasatch SDK integration
+- Thorlabs SDK: `thorlabs_tsi_sdk` (installed in `Rambot_venv` virtual environment)
 - Wasatch SDK: `wasatch` package
-- MadCity Labs: `madlib` library
+- MadCity Labs: ctypes + `Madlib.dll` (no Python SDK)
 - SAM model: `segmentation/sam_vit_b_01ec64.pth`
+- **Virtual environment**: `C:\Users\yifei\Documents\Rambot\Rambot_venv`
+
+### Session 7 (2026-01-31 - Camera Threading & View Switch Fix)
+- **CAMERA INITIALIZATION & VIEW SWITCHING FIXED**
+- Fixed camera initialization race: `_connect_lock` serializes `_connect_camera()` across all instances
+- Fixed SDK ref counting: `_sdk_ref_held` prevents incorrect decrement on disconnect
+- Fixed frame buffer safety: `np.ascontiguousarray()` in `_acquire_frame` prevents SDK buffer reuse
+- Both cameras now auto-start acquisition on connect (matches old noodlepy behavior)
+- View switch is now display-only: just changes `_current_camera`, no acquisition stop/start
+- Removed blocking `get_position()` call from GUI thread — uses cached `_current_position`
+- Stage offset movement dispatched via `request_move_to()` (fire-and-forget)
+- Removed QMessageBox dialog from view switch
+- Files changed: `camera_thread.py`, `live_view.py`, `main_window.py`
+
+### Session 8 (2026-01-31 - Wasatch SDK + Debug Mode)
+- **WASATCH SPECTROMETER SDK INTEGRATED + DEBUG MODE SYSTEM**
+- Implemented real Wasatch SDK in `spectrum_thread.py`:
+  - `WasatchBus` → `WasatchDevice` → `RealUSBDevice` connection flow
+  - `settings.wavenumbers` for Raman cm^-1 x-axis
+  - `fid.get_line()` for blocking spectrum acquisition (blocks for integration_time)
+  - `fid.set_integration_time_ms()`, `fid.set_laser_power_mW()`, `fid.set_laser_enable()` for hardware control
+  - `fid.set_laser_power_high_resolution(True)` for mW-level control
+  - Software averaging: accumulate N spectra in loop, check `_running`/`_acquiring` between each
+  - Auto-start acquisition on connect (like cameras)
+  - Response parsing handles `response.data.spectrum`, `response.data` list, or raw list
+- Added `debug_mode` system across all hardware:
+  - `HardwareConfig.debug_mode: bool = False` — master flag
+  - **Debug OFF (production)**: devices fail with error if hardware unavailable, stay disconnected
+  - **Debug ON**: devices fall back to simulation, "(SIM)" label shown in orange in status bar
+  - Debug mode checkbox in toolbar, propagated to all threads on Connect
+  - `is_simulated` property on `CameraThread`, `SpectrumThread`, `NanoPiezo`
+  - `DeviceIndicator` shows rich-text "(SIM)" in warning color when simulated
+- Added `SpectrometerConfig.laser_power_mw: float = 100.0`
+- Files changed: `hardware_config.py`, `spectrum_thread.py`, `camera_thread.py`, `nano_piezo.py`, `main_window.py`
+
+### Critical Thorlabs SDK Constraints
+- **Only one `TLCameraSDK` instance per process** — use `ThorlabsCameraManager` singleton
+- **Must call `discover_available_cameras()` before `open_camera()`** — done in manager init
+- **Error 1004 "Serial number not found"** occurs if SDK instance is recreated or discover not called
+- **DLL path must be configured before importing `thorlabs_tsi_sdk`** — `configure_thorlabs_dll_path()` handles this
 
 ---
 
@@ -399,4 +493,33 @@ raman_control/
 
 ---
 
-*Last Updated: 2026-01-30*
+### Session 9 (2026-01-31 - Segmentation Pipeline & Coordinate Conversion)
+- **CAPTURE → SEGMENT → PATTERN → COORDINATE PIPELINE IMPLEMENTED**
+- Added `pixel_size_x_um`, `pixel_size_y_um` to `CameraConfig`:
+  - Widefield: 2.82 um/pixel, Objective: 0.191 um/pixel (from old noodlepy calibration)
+- Rewrote `pattern_generator.py` with center-relative coordinate model:
+  - `CalibrationParams`: pixel_size, image dims, capture stage position, invert_y flag
+  - `pixel_to_stage()`: center → scale → flip Y → um→mm → add capture pos (matches old noodlepy)
+  - `SamplePosition`: added `obj_stage_x/y/z` (objective coords after offset), `coordinates_order` dict
+  - `from_centroids()`: accepts optional `coordinates_orders` list
+- Major `live_view.py` update:
+  - Constructor accepts `position_provider`, `widefield_config`, `objective_config`
+  - **Display freeze**: `_on_capture()` freezes display, records stage position via `position_provider()`
+  - **Return to Live** button: unfreezes display, clears overlays
+  - **Fast mask rendering**: numpy RGBA overlay (replaced pixel-by-pixel Python loop)
+  - **Radio buttons** for pattern type (replaced QComboBox)
+  - **Pattern algorithms** ported from old noodlepy `edgedetectorSAM.py`:
+    - Grid: meshgrid + mask filter + row/col tracking
+    - Ring: radial rays from centroid, edge trace, inward placement, angle sort, min-Y rotation
+    - Line: largest contiguous segment at centroid row
+    - Random: random mask pixel sampling
+  - **Coordinate conversion**: builds `CalibrationParams` from widefield config + capture state, emits `List[SamplePosition]`
+  - Always captures from widefield thread (segmentation is on wide FOV)
+- Fixed `main_window.py`:
+  - Passes `position_provider`, `widefield_config`, `objective_config` to `LiveViewWidget`
+  - `_on_camera_switch_requested()`: replaced broken `validate_objective_z()` → `can_switch_to_objective()`, `get_camera_switch_offset()` → `wide_to_obj_offset` property, `current_view =` → `switch_view()`
+  - Removed QMessageBox from camera switch (uses status bar message instead)
+  - `_on_positions_generated()`: applies `coordinate_manager.get_objective_position()` to set `obj_stage_x/y/z`
+- Files changed: `hardware_config.py`, `pattern_generator.py`, `live_view.py`, `main_window.py`
+
+*Last Updated: 2026-01-31 (Session 9 - Segmentation Pipeline & Coordinate Conversion)*

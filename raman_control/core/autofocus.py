@@ -307,20 +307,44 @@ class AutofocusEngine(QObject):
     # --- Spectrometer focus metrics (noodlepy, wavelength/nm windows) ---
     # Lower score = better focus (the autofocus scan minimises these).
 
+    # Default focus-score bands (nm), matching noodlepy: the quartz peak over
+    # the reflected laser line. Both are configurable per setup via
+    # SpectrometerConfig.af_signal_* / af_reference_* (Settings -> Spectrometer).
+    DEFAULT_SIGNAL_BAND_NM = (808.0, 815.0)
+    DEFAULT_REFERENCE_BAND_NM = (790.0, 795.0)
+
     @staticmethod
     def calculate_ratio_score(wavelength_nm: np.ndarray,
-                              intensity: np.ndarray) -> float:
-        """Ratio of the 808–815 nm band to the 790–795 nm band.
+                              intensity: np.ndarray,
+                              signal_band: Optional[Tuple[float, float]] = None,
+                              reference_band: Optional[Tuple[float, float]] = None
+                              ) -> float:
+        """Summed intensity of the signal band over that of the reference band.
 
-        Matches noodlepy: numerator = quartz peak (808–815 nm), denominator =
-        reflected laser (790–795 nm). Minimised during autofocus.
+        Defaults to noodlepy's bands: numerator = quartz peak (808-815 nm),
+        denominator = reflected laser (790-795 nm). Minimised during autofocus.
+
+        Both bands are ``(min_nm, max_nm)`` and inclusive. Returns ``inf``
+        (the worst score for a minimised metric) when either band is empty or
+        selects no pixels, so a mis-configured range can never look like a
+        perfect focus.
         """
         if wavelength_nm is None or intensity is None:
             return float('inf')
+        sig_lo, sig_hi = signal_band or AutofocusEngine.DEFAULT_SIGNAL_BAND_NM
+        ref_lo, ref_hi = reference_band or AutofocusEngine.DEFAULT_REFERENCE_BAND_NM
+        if sig_hi < sig_lo or ref_hi < ref_lo:
+            return float('inf')
+
         wl = np.asarray(wavelength_nm)
         inten = np.asarray(intensity, dtype=float)
-        reflected = inten[(wl >= 790) & (wl <= 795)]   # reflected laser
-        peak = inten[(wl >= 808) & (wl <= 815)]        # quartz peak
+        reflected = inten[(wl >= ref_lo) & (wl <= ref_hi)]
+        peak = inten[(wl >= sig_lo) & (wl <= sig_hi)]
+        # An empty band would sum to 0. For the numerator that would score 0,
+        # i.e. the BEST possible value for a minimised metric, and the scan
+        # would silently park at its first Z. Reject both cases instead.
+        if peak.size == 0 or reflected.size == 0:
+            return float('inf')
         denom = float(np.sum(reflected))
         if denom == 0:
             return float('inf')

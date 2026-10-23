@@ -42,6 +42,7 @@ from raman_control.gui.widgets.sample_grid import SampleGridWidget
 from raman_control.core.state_machine import AcquisitionStateMachine
 from raman_control.core.autofocus import AutofocusEngine
 from raman_control.core.coordinate_manager import CoordinateManager, CameraView
+from raman_control.core.slide_layout import plan_slide_hop, slide_at_position
 from raman_control.hardware.nano_piezo import NanoPiezo
 from raman_control.gui.dialogs.settings_dialog import SettingsDialog
 
@@ -200,6 +201,10 @@ class MainWindow(QMainWindow):
         self._nanodrive: Optional[NanoPiezo] = None
         self._coordinate_manager = CoordinateManager(self._config.stage)
         self._current_position = (0.0, 0.0, 0.0)  # Cached from position_changed signal
+        # Slide of the last manual objective-view move target. None = unknown
+        # (startup, after a view switch / acquisition), which forces the next
+        # manual objective move to hop over the slide barrier. See _manual_move.
+        self._obj_target_slide = None
 
         # Autofocus: buttons are gated until a Z range is registered, and only
         # one scan runs at a time.
@@ -295,6 +300,7 @@ class MainWindow(QMainWindow):
             nanodrive_config=self._config.nanodrive,
             coordinate_manager=self._coordinate_manager,
         )
+        self._stage_control.set_move_handler(self._manual_move)
         left_layout.addWidget(self._stage_control)
 
         # Sample Grid — below stage control (autofocus section)
@@ -684,7 +690,8 @@ class MainWindow(QMainWindow):
         # The well grid is in widefield (logical) coords; convert the physical
         # stage position back to logical (remove the objective offset in obj view).
         if cm.current_view == CameraView.OBJECTIVE:
-            lx, ly = x - cm.offset_x, y - cm.offset_y
+            lx = x - cm.offset_x
+            ly = y - cm.offset_y_at(lx)
         else:
             lx, ly = x, y
         row_f = (lx - stage.home_x - drop.offset_home_to_a1_x) / pitch
@@ -782,6 +789,8 @@ class MainWindow(QMainWindow):
                     return
 
                 self._coordinate_manager.switch_view(target_view)
+
+                self._obj_target_slide = None
                 # Update editable Z boxes (WF vs Obj) and the spectrometer
                 # focus buttons (objective view only).
                 self._stage_control.on_camera_view_changed()
@@ -833,22 +842,54 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    def _reset_nanodrive_to_initial(self):
+        """Park the NanoDrive at its configured initial position.
+
+        Runs on the autofocus worker thread (never the GUI thread) as the
+        prepare step of every COARSE Prusa Z scan. Without it the NanoDrive is
+        still sitting wherever the previous point's fine autofocus left it, so
+        the coarse scan is biased by that leftover fine offset and the fine
+        scan that follows starts off-center in its range. Resetting first makes
+        every coarse scan start from the same objective focus state.
+        """
+        nano = self._nanodrive
+        if not (nano and getattr(nano, 'is_connected', False)):
+            return
+        z0 = float(self._config.nanodrive.initial_position)
+        if nano.move_to(z=z0):
+            logger.info(f"NanoDrive reset to initial position {z0:.1f} um "
+                        f"before the Prusa autofocus scan")
+        else:
+            logger.warning(f"NanoDrive reset to {z0:.1f} um failed; "
+                           f"the Prusa scan continues from its current Z")
+
     def _start_af(self, positions, move_fn, score_fn, settle, label,
                   plot_stage=None, on_finish=None, maximize=True,
-                  focus_kind=None):
-        """Launch an AutofocusWorker and wire its signals to the UI."""
+                  focus_kind=None, prepare=None):
+        """Launch an AutofocusWorker and wire its signals to the UI.
+
+        ``on_finish`` runs on EVERY exit path, including the refusals below:
+        the caller has already applied its autofocus spectrometer settings by
+        this point, so returning without it would strand the device at the
+        autofocus exposure.
+        """
         if self._af_worker is not None and self._af_worker.isRunning():
+            if on_finish is not None:
+                on_finish()
             return  # one scan at a time
         if self._acq_worker is not None and self._acq_worker.isRunning():
             self._status_widget.show_message(
                 "Autofocus unavailable during acquisition", 3000)
+            if on_finish is not None:
+                on_finish()
             return
         if plot_stage:
             self._spectrum_viewer.clear_focus_plot(plot_stage)
         self._status_widget.set_progress(0, label)
 
         worker = AutofocusWorker(positions, move_fn, score_fn,
-                                 settle_s=settle, label=label, maximize=maximize)
+                                 settle_s=settle, label=label, maximize=maximize,
+                                 prepare_fn=prepare)
         worker.progress.connect(self._status_widget.set_progress)
         if plot_stage:
             worker.point.connect(
@@ -894,9 +935,12 @@ class MainWindow(QMainWindow):
 
         # Let stage vibration settle before grabbing the frame to score (the
         # Prusa Z step shakes the stage; too short and a blurry frame is scored).
+        # The NanoDrive goes back to its initial position first so the coarse
+        # scan always starts from the same objective focus state.
         self._start_af(positions, move, score,
                        settle=self._config.widefield_camera.af_settle_time,
-                       label="Camera AF", maximize=True, focus_kind='cam_prusa')
+                       label="Camera AF", maximize=True, focus_kind='cam_prusa',
+                       prepare=self._reset_nanodrive_to_initial)
 
     def _on_prusa_autofocus(self, params: dict):
         """Spectrometer coarse autofocus: step the Prusa Z, maximise signal."""
@@ -921,11 +965,15 @@ class MainWindow(QMainWindow):
             return self._motion_thread.move_z_blocking(z, timeout=30.0)
 
         def score():
-            return self._spectrum_focus_score(reps, expo_ms)
+            return self._spectrum_focus_score(reps, expo_ms, stage='prusa')
 
+        # Reset the NanoDrive to its initial position before the coarse scan,
+        # otherwise it is still parked at the previous point's fine focus and
+        # biases every score in this scan.
         self._start_af(positions, move, score, settle=0.05, label="Prusa AF",
                        plot_stage='prusa', on_finish=restore, maximize=False,
-                       focus_kind='spec_prusa')
+                       focus_kind='spec_prusa',
+                       prepare=self._reset_nanodrive_to_initial)
 
     def _on_nanodrive_autofocus(self, params: dict):
         """Spectrometer fine autofocus: step the NanoDrive, maximise signal."""
@@ -951,7 +999,7 @@ class MainWindow(QMainWindow):
             return True
 
         def score():
-            return self._spectrum_focus_score(reps, expo_ms)
+            return self._spectrum_focus_score(reps, expo_ms, stage='nano')
 
         self._start_af(positions, move, score, settle=0.03, label="Nano AF",
                        plot_stage='nano', on_finish=restore, maximize=False,
@@ -959,18 +1007,39 @@ class MainWindow(QMainWindow):
 
     def _apply_af_spectrometer_settings(self, params: dict):
         """Apply the autofocus exposure/power to the spectrometer; return a
-        callable that restores the acquisition settings afterward."""
-        prev_expo = self._config.spectrometer.integration_time
-        prev_power = self._config.spectrometer.laser_power_mw
-        self._spectrometer.set_integration_time(float(params.get("exposure_ms", 100)))
-        self._spectrometer.set_laser_power_mw(float(params.get("power_mw", prev_power)))
+        callable that puts the ACQUISITION exposure/power back.
+
+        The restore reads the spectrometer panel's own Expo. Time / Power boxes
+        AT RESTORE TIME instead of a value snapshotted here. Snapshotting read
+        ``config.integration_time``, which the autofocus itself overwrites, so
+        the device could be left sitting at the autofocus exposure; going back
+        to what the panel shows is what the next manual capture expects.
+        """
+        sv = self._spectrum_viewer
+        acq_power = sv.acquisition_power_mw()
+        # Pause the free-running live view for the scan so only the scored
+        # autofocus frames are taken (and plotted); _restore resumes it.
+        self._spectrometer.hold_live()
+        released = [False]
+        self._spectrometer.set_integration_time(
+            float(params.get("exposure_ms", 100)))
+        self._spectrometer.set_laser_power_mw(
+            float(params.get("power_mw", acq_power)))
 
         def _restore():
-            self._spectrometer.set_integration_time(prev_expo)
-            self._spectrometer.set_laser_power_mw(prev_power)
+            expo = sv.acquisition_exposure_ms()
+            power = sv.acquisition_power_mw()
+            self._spectrometer.set_integration_time(expo)
+            self._spectrometer.set_laser_power_mw(power)
+            if not released[0]:  # release this scan's hold exactly once
+                released[0] = True
+                self._spectrometer.release_live()
+            logger.info(f"Autofocus finished: spectrometer restored to the "
+                        f"acquisition settings ({expo:.0f} ms, {power:.0f} mW)")
         return _restore
 
-    def _spectrum_focus_score(self, reps: int, expo_ms: float) -> float:
+    def _spectrum_focus_score(self, reps: int, expo_ms: float,
+                              stage: str = 'prusa') -> float:
         """Median of `reps` FRESH spectra (cosmic-ray rejection) → noodlepy
         ratio. Lower is better (the scan minimises).
 
@@ -988,7 +1057,11 @@ class MainWindow(QMainWindow):
         median = np.median(frames, axis=0)
         wl_nm = spec.wavelengths_nm
         try:
-            return float(AutofocusEngine.calculate_ratio_score(wl_nm, median))
+            spec_cfg = self._config.spectrometer
+            return float(AutofocusEngine.calculate_ratio_score(
+                wl_nm, median,
+                signal_band=spec_cfg.af_signal_band(stage),
+                reference_band=spec_cfg.af_reference_band(stage)))
         except Exception:  # noqa: BLE001
             return float('inf')
 
@@ -1094,7 +1167,17 @@ class MainWindow(QMainWindow):
             position_provider=lambda: self._current_position,
             wavelengths_nm_provider=lambda: self._spectrometer.wavelengths_nm,
             offset=(cm.offset_x, cm.offset_y, cm.offset_z),
+            # Y offset varies linearly with widefield X (calibration curve).
+            offset_y_provider=cm.offset_y_at,
             excitation_nm=self._config.spectrometer.excitation_wavelength_nm,
+            # Focus-score bands (Settings -> Spectrometer), so a run scores
+            # focus exactly like the interactive autofocus does.
+            af_prusa_signal_band_nm=self._config.spectrometer.af_signal_band('prusa'),
+            af_prusa_reference_band_nm=(
+                self._config.spectrometer.af_reference_band('prusa')),
+            af_nano_signal_band_nm=self._config.spectrometer.af_signal_band('nano'),
+            af_nano_reference_band_nm=(
+                self._config.spectrometer.af_reference_band('nano')),
             wf_prusa_range=(wf_lo, wf_up),
             obj_prusa_range=(obj_lo, obj_up),
             nano_range=(nano_lo, nano_up),
@@ -1106,6 +1189,7 @@ class MainWindow(QMainWindow):
             # ones, so the saved overlay shows them too.
             capture_image=getattr(self._live_view, '_captured_image', None),
             capture_mask=getattr(self._live_view, '_current_mask', None),
+            pixel_size_um=(self._config.widefield_camera.pixel_size_x_um or 1.0),
             # Current FoV file names drop sample/droplet/position (start at the
             # pattern), so no droplet identity is passed here.
         )
@@ -1117,10 +1201,15 @@ class MainWindow(QMainWindow):
         worker.error.connect(self._on_acq_error)
         worker.view_changed.connect(self._on_acq_view_changed)
         worker.finished_acq.connect(self._on_acq_finished)
+        # Highlight the point being measured (green) on the captured-image
+        # preview, synced with the acquisition steps.
+        worker.measuring_point.connect(self._on_measuring_point)
         # Stream the per-point autofocus scores to the Live-tab focus plot,
         # just like the interactive spectrometer autofocus does.
         worker.focus_started.connect(self._spectrum_viewer.clear_focus_plot)
         worker.focus_point.connect(self._spectrum_viewer.add_focus_point)
+        # Update the Live-tab autofocus panel's focus-Z labels as each scan ends.
+        worker.focus_result.connect(self._stage_control.set_focus_result)
         # Let the worker drive the illumination LED (on for widefield autofocus,
         # off afterwards) through the LED control widget so the button stays in
         # sync. Queued because the worker lives on its own thread.
@@ -1129,6 +1218,8 @@ class MainWindow(QMainWindow):
         self._protocol_panel.on_acquisition_started()
         # Lock the UI (everything but Pause/Stop) for the duration of the run.
         self._set_ui_locked(True)
+        # The Live-tab sample map can't move the stage mid-run.
+        self._sample_grid.set_acquisition_active(True)
         self._status_widget.show_message(
             f"Current FoV acquisition: {len(points)} points", 4000)
         logger.info(f"Starting Current-FoV acquisition over {len(points)} points")
@@ -1201,18 +1292,31 @@ class MainWindow(QMainWindow):
             position_provider=lambda: self._current_position,
             wavelengths_nm_provider=lambda: self._spectrometer.wavelengths_nm,
             offset=(cm.offset_x, cm.offset_y, cm.offset_z),
+            # Y offset varies linearly with widefield X (calibration curve).
+            offset_y_provider=cm.offset_y_at,
             excitation_nm=self._config.spectrometer.excitation_wavelength_nm,
+            # Focus-score bands (Settings -> Spectrometer), so a run scores
+            # focus exactly like the interactive autofocus does.
+            af_prusa_signal_band_nm=self._config.spectrometer.af_signal_band('prusa'),
+            af_prusa_reference_band_nm=(
+                self._config.spectrometer.af_reference_band('prusa')),
+            af_nano_signal_band_nm=self._config.spectrometer.af_signal_band('nano'),
+            af_nano_reference_band_nm=(
+                self._config.spectrometer.af_reference_band('nano')),
             wf_prusa_range=(wf_lo, wf_up),
             obj_prusa_range=(obj_lo, obj_up),
             nano_range=(nano_lo, nano_up),
             af_settle_s=self._config.widefield_camera.af_settle_time,
             af_capture_stabilization_s=(
                 self._config.widefield_camera.af_capture_stabilization_time),
+            pixel_size_um=(self._config.widefield_camera.pixel_size_x_um or 1.0),
             segmenter=segmenter,
             pattern_settings=pattern_settings,
             # Per-droplet sample name + number for the structured file names
             # (the worker also uses each droplet's well as its position).
             droplet_map=self._sample_grid.droplet_map(),
+            slide_change_z_clearance=self._config.stage.slide_change_z_clearance,
+            stage_z_max=self._config.stage.z_max,
         )
 
         worker = RoboticDepositionWorker(ctx, wells, params)
@@ -1222,15 +1326,29 @@ class MainWindow(QMainWindow):
         worker.error.connect(self._on_acq_error)
         worker.view_changed.connect(self._on_acq_view_changed)
         worker.finished_acq.connect(self._on_acq_finished)
+        worker.measuring_point.connect(self._on_measuring_point)
         worker.focus_started.connect(self._spectrum_viewer.clear_focus_plot)
         worker.focus_point.connect(self._spectrum_viewer.add_focus_point)
+        worker.focus_result.connect(self._stage_control.set_focus_result)
         worker.led_set.connect(self._led_control.set_on)
         # Show each droplet's captured image + segmentation + points as the robot
         # processes it, so it's clear the run moves between distinct droplets.
         worker.droplet_segmented.connect(self._on_droplet_segmented)
+        # Highlight the droplet currently being measured on the sample map.
+        worker.droplet_active.connect(self._on_droplet_active)
+        # During the upfront capture phase, highlight the droplet being captured
+        # WITHOUT a check mark (it has not been measured yet).
+        worker.droplet_capturing.connect(self._on_droplet_capturing)
         self._acq_worker = worker
         self._protocol_panel.on_acquisition_started()
         self._set_ui_locked(True)
+        # Switch BOTH sample maps (Live + Auto tab) to the same acquisition
+        # display over the acquired droplets (measured / current / to-measure /
+        # unselected), and make them non-interactive.
+        self._sample_grid.set_acquisition_active(True, selected=droplets)
+        auto_grid = getattr(self._protocol_panel, '_sample_grid', None)
+        if auto_grid is not None:
+            auto_grid.set_acquisition_active(True, selected=droplets)
         self._status_widget.show_message(
             f"Robotic Deposition: {len(wells)} droplets", 4000)
         logger.info(f"Starting Robotic Deposition over {len(wells)} droplets")
@@ -1246,6 +1364,35 @@ class MainWindow(QMainWindow):
             payload.get('positions') or [],
             payload.get('capture_xyz') or (0.0, 0.0, 0.0),
         )
+
+    def _on_measuring_point(self, idx: int):
+        """The worker is measuring point ``idx`` (0-based): show it in green on
+        the captured-image preview (and its Auto-tab mirror)."""
+        self._live_view.set_active_point(idx + 1)
+
+    def _on_droplet_active(self, name: str):
+        """The Robotic worker moved to droplet ``name``: mark it current on BOTH
+        sample maps (the previous one becomes 'measured')."""
+        from raman_control.gui.widgets.sample_grid import well_rc
+        rc = well_rc(name)
+        if rc is None:
+            return
+        self._sample_grid.set_measuring_well(*rc)
+        auto_grid = getattr(self._protocol_panel, '_sample_grid', None)
+        if auto_grid is not None:
+            auto_grid.set_measuring_well(*rc)
+
+    def _on_droplet_capturing(self, name: str):
+        """Upfront capture phase: highlight droplet ``name`` as being captured on
+        BOTH sample maps WITHOUT a check mark (it is imaged, not yet measured)."""
+        from raman_control.gui.widgets.sample_grid import well_rc
+        rc = well_rc(name)
+        if rc is None:
+            return
+        self._sample_grid.set_capturing_well(*rc)
+        auto_grid = getattr(self._protocol_panel, '_sample_grid', None)
+        if auto_grid is not None:
+            auto_grid.set_capturing_well(*rc)
 
     def _acq_running(self) -> bool:
         """True while a Current-FoV acquisition worker is active."""
@@ -1265,11 +1412,13 @@ class MainWindow(QMainWindow):
         pnl = self._protocol_panel
         # The panel owns Start/Pause/Stop via on_acquisition_started/finished.
         # The laser on/off button stays usable during a run (safety: the user
-        # must always be able to kill the laser).
+        # must always be able to kill the laser). The spectrum plot's Auto Scale
+        # stays usable too, so the live spectrum can be rescaled mid-run.
         owned = {getattr(pnl, '_start_btn', None),
                  getattr(pnl, '_pause_btn', None),
                  getattr(pnl, '_stop_btn', None),
-                 getattr(self._spectrum_viewer, '_laser_btn', None)}
+                 getattr(self._spectrum_viewer, '_laser_btn', None),
+                 getattr(self._spectrum_viewer, '_autoscale_btn', None)}
 
         from PyQt6.QtCore import Qt
         if locked:
@@ -1323,6 +1472,7 @@ class MainWindow(QMainWindow):
         target = CameraView.OBJECTIVE if view == 'objective' else CameraView.WIDE_FOV
         if self._coordinate_manager.current_view != target:
             self._coordinate_manager.switch_view(target)
+            self._obj_target_slide = None
             # The UI is locked during a run, so don't re-enable stage / AF
             # controls here; they're re-synced to the final view on finish.
             if not (self._acq_worker is not None and self._acq_worker.isRunning()):
@@ -1332,6 +1482,13 @@ class MainWindow(QMainWindow):
 
     def _on_acq_finished(self, aborted: bool, n_saved: int):
         self._protocol_panel.on_acquisition_finished(aborted)
+        # Clear the green current-acquisition point highlight.
+        self._live_view.set_active_point(None)
+        # Return the sample maps to their interactive selection display.
+        self._sample_grid.set_acquisition_active(False)
+        auto_grid = getattr(self._protocol_panel, '_sample_grid', None)
+        if auto_grid is not None:
+            auto_grid.set_acquisition_active(False)
         # Re-enable the UI that was locked for the run.
         self._set_ui_locked(False)
         # Let the worker's run() fully return before dropping our reference, so
@@ -1359,6 +1516,7 @@ class MainWindow(QMainWindow):
                            "Live view to widefield so its controls are usable.")
             if self._coordinate_manager.current_view != CameraView.WIDE_FOV:
                 self._coordinate_manager.switch_view(CameraView.WIDE_FOV)
+                self._obj_target_slide = None
             self._live_view.switch_camera('wide')
         # Re-sync stage-panel Z-box editability and AF buttons to the final view.
         self._stage_control.on_camera_view_changed()
@@ -1382,6 +1540,13 @@ class MainWindow(QMainWindow):
                     "Current FoV: returning stage to capture center "
                     f"({cap_pos[0]:.3f}, {cap_pos[1]:.3f}, {cap_pos[2]:.3f})")
 
+        # Re-illuminate the sample for live viewing (the run turned the LED off
+        # for the Raman measurements). Done last, after the Live controls +
+        # widefield view are restored, so the Live view is usable and lit. This
+        # runs on both a normal completion and a mid-run stop, so the LED is
+        # always back on once auto acquisition ends.
+        self._led_control.set_on(True)
+
         msg = (f"Acquisition stopped ({n_saved} spectra saved)" if aborted
                else f"Acquisition complete: {n_saved} spectra saved")
         self._status_widget.show_message(msg, 6000)
@@ -1401,12 +1566,13 @@ class MainWindow(QMainWindow):
             pos.obj_stage_y = obj_y
             pos.obj_stage_z = obj_z
 
+        cm = self._coordinate_manager
+        dy_note = (f"dy=curve @ each point's X"
+                   if cm.offset_curve_active else f"dy={cm.offset_y}")
         logger.info(
             f"Received {len(positions)} sample positions "
-            f"(objective offset applied: "
-            f"dx={self._coordinate_manager.offset_x}, "
-            f"dy={self._coordinate_manager.offset_y}, "
-            f"dz={self._coordinate_manager.offset_z})"
+            f"(objective offset applied: dx={cm.offset_x}, {dy_note}, "
+            f"dz={cm.offset_z})"
         )
 
     def _on_move_to_point(self, logical_x: float, logical_y: float, logical_z: float):
@@ -1442,7 +1608,7 @@ class MainWindow(QMainWindow):
         self._status_widget.show_message(
             f"Moving to point ({logical_x:.2f}, {logical_y:.2f}) [{view}]..."
         )
-        self._motion_thread.request_move_to(x=phys_x, y=phys_y)
+        self._manual_move(phys_x, phys_y)
 
     def _on_well_clicked(self, row: int, col: int):
         """Move stage to the clicked well position.
@@ -1489,7 +1655,63 @@ class MainWindow(QMainWindow):
                     f"physical=({phys_x:.2f}, {phys_y:.2f}), "
                     f"view={self._coordinate_manager.current_view.name}")
         self._status_widget.show_message(f"Moving to well {name}...")
-        self._motion_thread.request_move_to(x=phys_x, y=phys_y)
+        self._manual_move(phys_x, phys_y)
+
+    def _manual_move(self, phys_x: float, phys_y: float,
+                     phys_z: Optional[float] = None) -> None:
+        """Queue a manual stage move (well click, pattern-point click, Go).
+
+        In objective view, if the target is on a different slide than the
+        objective is over (or either is unknown), hop over the barrier between
+        slides: lift Z to the objective "Highest" + clearance, travel XY, lower
+        to "Highest", then (if ``phys_z`` is given) go to ``phys_z``. All moves
+        are fire-and-forget; the motion thread executes them in order, so the
+        GUI thread never waits on the stage. Widefield moves are unchanged."""
+        cm = self._coordinate_manager
+        if cm.current_view != CameraView.OBJECTIVE:
+            self._motion_thread.request_move_to(x=phys_x, y=phys_y, z=phys_z)
+            return
+
+        stage_cfg, drop_cfg = self._config.stage, self._config.sample_drop
+        cur = self._current_position
+        # Slides are defined on the widefield (logical) grid; convert both the
+        # objective's current and target positions back to it.
+        cur_lx, cur_ly, _ = cm.physical_to_logical(cur[0], cur[1], cur[2])
+        tgt_lx, tgt_ly, _ = cm.physical_to_logical(phys_x, phys_y, cur[2])
+        cur_slide = slide_at_position(cur_lx, cur_ly, stage_cfg, drop_cfg)
+        tgt_slide = slide_at_position(tgt_lx, tgt_ly, stage_cfg, drop_cfg)
+        # The cached position lags queued moves, so also compare against the
+        # last commanded target; hop unless both agree with the target.
+        same_slide = (tgt_slide is not None and cur_slide == tgt_slide
+                      and self._obj_target_slide == tgt_slide)
+        if same_slide:
+            self._motion_thread.request_move_to(x=phys_x, y=phys_y, z=phys_z)
+            return
+
+        obj_hi, obj_lo = self._stage_control.get_objective_z_limits()
+        if not obj_hi > obj_lo:
+            msg = ("Move blocked: set the objective Z limits (Highest > Lowest) "
+                   "so the objective can lift over the slide barrier")
+            logger.warning(msg)
+            self._status_widget.show_message(msg, 5000)
+            return
+
+        moves = plan_slide_hop(phys_x, phys_y, cur[2], obj_hi,
+                               stage_cfg.slide_change_z_clearance,
+                               stage_cfg.z_max)
+        src = "?" if cur_slide is None else str(cur_slide)
+        dst = "?" if tgt_slide is None else str(tgt_slide)
+        logger.info(
+            f"Manual slide hop {src} -> {dst}: Z up to {moves[0][2]:.3f}, "
+            f"XY to ({phys_x:.3f}, {phys_y:.3f}), Z down to {obj_hi:.3f}"
+            + (f", then Z {phys_z:.3f}" if phys_z is not None else ""))
+        self._status_widget.show_message(
+            f"Slide {src} -> {dst}: lifting objective over barrier...")
+        for x, y, z in moves:
+            self._motion_thread.request_move_to(x=x, y=y, z=z)
+        if phys_z is not None:
+            self._motion_thread.request_move_to(z=phys_z)
+        self._obj_target_slide = tgt_slide
 
     def _on_open_settings(self):
         """Open the hardware settings dialog."""

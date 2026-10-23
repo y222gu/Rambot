@@ -22,6 +22,8 @@ from PyQt6.QtCore import QPointF
 
 from raman_control.gui.styles import COLORS
 from raman_control.config.logging_config import get_logger
+from raman_control.core.slide_layout import (  # noqa: F401 (re-exported)
+    ROW_GROUPS, COL_GROUPS, slide_of_well)
 
 logger = get_logger('sample_grid')
 
@@ -49,18 +51,8 @@ VALID_WELLS = {
     "P4", "P5", "P10", "P11", "P16", "P17", "P22", "P23",
 }
 
-# Slide clusters: 3 row-groups x 4 column-groups = 12 slides, 16 spots each
-ROW_GROUPS = [
-    [0, 1, 2, 3, 4],      # A-E
-    [6, 7, 8, 9],          # G-J
-    [11, 12, 13, 14, 15],  # L-P
-]
-COL_GROUPS = [
-    [3, 4, 5, 6],
-    [9, 10, 11, 12],
-    [15, 16, 17, 18],
-    [21, 22, 23, 24],
-]
+# Slide clusters (ROW_GROUPS / COL_GROUPS) and slide numbering live in
+# core.slide_layout, shared with the acquisition worker's slide-change hop.
 
 # Grid drawing constants
 WELL_RADIUS = 10
@@ -68,9 +60,9 @@ WELL_SPACING = 26
 SLIDE_GAP = 14
 LABEL_OFFSET = 34
 
-# Unselected wells are grey; selecting one adds an ORANGE edge and a check mark
-# (the orange that the home-fiducial L-mark used to be).
-SELECT_GOLD = COLORS['warning']  # orange (#ff9800)
+# A highlighted well gets a cyan edge; a check mark marks the selected/current/
+# measured well (see WellCircle / SampleGridWidget for when each is shown).
+HIGHLIGHT_CYAN = COLORS['accent_primary']  # cyan/teal (#00b4b4)
 UNSELECTED_GREY = '#808080'
 
 # Matplotlib 'tab20' qualitative palette — matches the colours the Opentrons
@@ -90,6 +82,17 @@ _SLOT_ORDER = [1, 4, 7, 10]
 def well_name(row: int, col: int) -> str:
     """Convert row/col indices to well name (e.g., 0,0 -> 'A1')."""
     return f"{ROW_LABELS[row]}{col + 1}"
+
+
+def well_rc(name: str) -> Optional[Tuple[int, int]]:
+    """Inverse of well_name: 'B5' -> (1, 4). None if it can't be parsed."""
+    name = str(name).strip().upper()
+    if len(name) < 2 or name[0] not in ROW_LABELS:
+        return None
+    try:
+        return (ROW_LABELS.index(name[0]), int(name[1:]) - 1)
+    except ValueError:
+        return None
 
 
 def _contrast_text(hex_color: str) -> str:
@@ -129,21 +132,17 @@ class WellCircle(QGraphicsEllipseItem):
         self.setPos(x, y)
 
         self._radius = radius
-        self._selected = False
+        # Two independent marks: a cyan edge (highlight) and a check mark, plus
+        # a disabled (greyed) state. The owning grid decides which combination
+        # each well gets (selection vs. acquisition display).
+        self._highlighted = False
+        self._checked = False
         self._hovered = False
         self._disabled = False
-        # Per-sample fill from a loaded config (None -> default blue).
+        # Per-sample fill from a loaded config (None -> default grey).
         self._sample_color: Optional[str] = None
         self.setAcceptHoverEvents(True)
         self._update_style()
-
-    def _selected_fill(self) -> QColor:
-        """Fill when selected: the sample colour if a config is loaded, else
-        stay GREY (selection is shown only by the orange edge + check mark, so
-        wells with no config info don't change colour when picked)."""
-        if self._sample_color:
-            return QColor(self._sample_color)
-        return QColor(UNSELECTED_GREY)
 
     def _update_style(self):
         if self._disabled:
@@ -154,30 +153,22 @@ class WellCircle(QGraphicsEllipseItem):
             self.update()
             return
 
-        # Base fill = the per-sample config colour if one is loaded (so droplets
-        # show their colour as soon as a config loads, not only when selected),
-        # else grey for un-configured wells.
-        base_fill = (QColor(self._sample_color) if self._sample_color
-                     else QColor(UNSELECTED_GREY))
-
-        if self._selected:
-            # Selection just adds a gold edge (+ a check mark in paint); the fill
-            # stays the sample colour.
-            self.setBrush(QBrush(self._selected_fill()))
-            self.setPen(QPen(QColor(SELECT_GOLD), 2.5))
+        # Fill = the per-sample config colour if one is loaded (so droplets show
+        # their colour as soon as a config loads), else grey for un-configured.
+        self.setBrush(QBrush(QColor(self._sample_color) if self._sample_color
+                             else QColor(UNSELECTED_GREY)))
+        if self._highlighted:
+            self.setPen(QPen(QColor(HIGHLIGHT_CYAN), 2.5))
+        elif self._hovered:
+            self.setPen(QPen(QColor(COLORS['accent_primary']), 2))
         else:
-            self.setBrush(QBrush(base_fill))
-            if self._hovered:
-                self.setPen(QPen(QColor(COLORS['accent_primary']), 2))
-            else:
-                self.setPen(QPen(QColor('#5a5a5a'), 1))
+            self.setPen(QPen(QColor('#5a5a5a'), 1))
         self.update()
 
     def paint(self, painter, option, widget=None):
-        """Draw the circle, then a black check mark in the centre when
-        selected."""
+        """Draw the circle, then a check mark in the centre when checked."""
         super().paint(painter, option, widget)
-        if not self._selected or self._disabled:
+        if not self._checked or self._disabled:
             return
         r = self._radius
         pen = QPen(QColor('black'))
@@ -197,8 +188,11 @@ class WellCircle(QGraphicsEllipseItem):
         self._sample_color = hex_color
         self._update_style()
 
-    def set_selected(self, selected: bool):
-        self._selected = selected
+    def apply_state(self, disabled: bool, highlighted: bool, checked: bool):
+        """Set the full visual state in one call (the grid recomputes it)."""
+        self._disabled = disabled
+        self._highlighted = highlighted
+        self._checked = checked
         self._update_style()
 
     def set_disabled(self, disabled: bool):
@@ -246,6 +240,18 @@ class SampleGridWidget(QWidget):
         self._current_position: Optional[Tuple[int, int]] = None
         self._selected_positions: Set[Tuple[int, int]] = set()
         self._initial_scroll_done = False
+        # While a run is active the grid is non-interactive. If a set of droplets
+        # being acquired is given (Robotic), it also switches to the acquisition
+        # DISPLAY: measured / current / to-measure / unselected states. Both the
+        # Live and Auto-tab maps use this identical display during a run.
+        self._acquisition_active = False
+        self._acquisition_display = False
+        self._measuring_position: Optional[Tuple[int, int]] = None
+        self._measured_positions: Set[Tuple[int, int]] = set()
+        # Droplet currently being CAPTURED (upfront capture phase): highlighted
+        # with a cyan edge but NO check mark — it has not been measured yet, so
+        # it must not look 'done'. Distinct from _measuring_position.
+        self._capturing_position: Optional[Tuple[int, int]] = None
 
         # Rubber-band drag selection (multi-select mode only).
         self._rubber_band: Optional[QRubberBand] = None
@@ -492,10 +498,104 @@ class SampleGridWidget(QWidget):
         self._view.mouseMoveEvent = self._on_view_mouse_move
         self._view.mouseReleaseEvent = self._on_view_mouse_release
 
+    # --- well styling (single source of truth for each well's look) ---------
+    def _interactive(self) -> bool:
+        """True when the user may click/drag the grid (enabled and not mid-run)."""
+        return self._grid_enabled and not self._acquisition_active
+
+    def _is_disabled(self, pos) -> bool:
+        """A well is greyed out when the grid is disabled (stage not referenced)
+        or, in the acquisition display, when it isn't an acquired droplet."""
+        if not self._grid_enabled:
+            return True
+        return (self._acquisition_display
+                and pos not in self._selected_positions)
+
+    def _well_marks(self, pos) -> Tuple[bool, bool]:
+        """(highlighted, checked) for a well given the current mode/state.
+
+        acquisition   : measuring -> cyan edge + check; measured -> check only;
+                        other acquired (to measure) -> neither. (Same in both
+                        the Live and Auto-tab maps.)
+        multi, picking : selected wells -> cyan edge, no check.
+        single, idle  : the current ('you are here') well -> cyan edge + check.
+        """
+        if self._acquisition_display:
+            if pos == self._measuring_position:
+                return (True, True)
+            if pos in self._measured_positions:
+                return (False, True)
+            # Being captured (not yet measured): cyan edge, no check.
+            if pos == self._capturing_position:
+                return (True, False)
+            return (False, False)
+        if self._multi_select:
+            return (pos in self._selected_positions, False)
+        is_current = (pos == self._current_position)
+        return (is_current, is_current)
+
+    def _refresh_styles(self):
+        """Re-apply every well's look from the current state."""
+        for pos, circle in self._circles.items():
+            hl, ck = self._well_marks(pos)
+            circle.apply_state(self._is_disabled(pos), hl, ck)
+
+    def _restyle(self, pos):
+        """Re-apply one well's look."""
+        circle = self._circles.get(pos)
+        if circle is not None:
+            hl, ck = self._well_marks(pos)
+            circle.apply_state(self._is_disabled(pos), hl, ck)
+
+    def set_acquisition_active(self, active: bool, selected=None):
+        """Enter/leave acquisition mode: the grid stops responding to clicks.
+
+        When ``selected`` (an iterable of acquired (row, col) droplets) is given,
+        the grid also switches to the acquisition DISPLAY (measured / current /
+        to-measure / unselected) — identical in the Live and Auto-tab maps. With
+        no ``selected`` it just becomes non-interactive, keeping its normal look.
+        Leaving resets the per-run state."""
+        self._acquisition_active = bool(active)
+        self._acquisition_display = bool(active and selected is not None)
+        if self._acquisition_display:
+            self._selected_positions = set(selected)
+        if not active:
+            self._measuring_position = None
+            self._measured_positions.clear()
+            self._capturing_position = None
+            # The single-select (Live) map keeps no persistent selection.
+            if not self._multi_select:
+                self._selected_positions.clear()
+        self._refresh_styles()
+
+    def set_capturing_well(self, row: int, col: int):
+        """Mark the droplet now being CAPTURED (upfront capture phase) with a
+        cyan edge but no check mark — it has not been measured yet. No-op outside
+        the acquisition display."""
+        if not self._acquisition_display:
+            return
+        pos = (row, col)
+        self._capturing_position = pos if pos in self._circles else None
+        self._refresh_styles()
+
+    def set_measuring_well(self, row: int, col: int):
+        """Mark the droplet now being measured (cyan + check); the previous one
+        becomes 'measured' (check only). No-op outside the acquisition display."""
+        if not self._acquisition_display:
+            return
+        pos = (row, col)
+        # Measurement has started, so no droplet is in the 'capturing' state.
+        self._capturing_position = None
+        if (self._measuring_position is not None
+                and self._measuring_position != pos):
+            self._measured_positions.add(self._measuring_position)
+        self._measuring_position = pos if pos in self._circles else None
+        self._refresh_styles()
+
     # --- rubber-band drag selection (multi-select) --------------------------
     def _on_view_mouse_press(self, event: QMouseEvent):
         """Begin a potential drag-select (multi-select mode)."""
-        if (self._multi_select and self._grid_enabled
+        if (self._multi_select and self._interactive()
                 and event.button() == Qt.MouseButton.LeftButton):
             self._drag_origin = event.pos()
             self._dragging = False
@@ -507,7 +607,7 @@ class SampleGridWidget(QWidget):
 
     def _on_view_mouse_move(self, event: QMouseEvent):
         """Grow the rubber band once the cursor moves past a small threshold."""
-        if (self._multi_select and self._grid_enabled
+        if (self._multi_select and self._interactive()
                 and self._drag_origin is not None
                 and (event.buttons() & Qt.MouseButton.LeftButton)):
             rect = QRect(self._drag_origin, event.pos()).normalized()
@@ -534,16 +634,15 @@ class SampleGridWidget(QWidget):
         for pos in hit:
             if deselect:
                 self._selected_positions.discard(pos)
-                self._circles[pos].set_selected(False)
             else:
                 self._selected_positions.add(pos)
-                self._circles[pos].set_selected(True)
+            self._restyle(pos)
         self._count_label.setText(f"{len(self._selected_positions)} selected")
         self.selection_changed.emit(list(self._selected_positions))
 
     def _on_view_mouse_release(self, event: QMouseEvent):
         """Finish a drag-select, or handle a plain click. Ignored if disabled."""
-        if not self._grid_enabled:
+        if not self._interactive():
             self._drag_origin = None
             self._dragging = False
             return
@@ -570,34 +669,33 @@ class SampleGridWidget(QWidget):
         if self._multi_select:
             if pos in self._selected_positions:
                 self._selected_positions.discard(pos)
-                item.set_selected(False)
             else:
                 self._selected_positions.add(pos)
-                item.set_selected(True)
+            self._restyle(pos)
             self._count_label.setText(f"{len(self._selected_positions)} selected")
             self.selection_changed.emit(list(self._selected_positions))
         else:
-            if self._current_position and self._current_position in self._circles:
-                self._circles[self._current_position].set_selected(False)
-            item.set_selected(True)
+            old = self._current_position
             self._current_position = pos
+            if old and old != pos:
+                self._restyle(old)
+            self._restyle(pos)
             self._info_label.setText(f"Moving to {well_name(*pos)}")
             self.position_selected.emit(item.row, item.col)
 
     def _on_select_all(self):
-        if not self._grid_enabled:
+        if not self._interactive():
             return
-        self._selected_positions.clear()
-        for pos, circle in self._circles.items():
-            circle.set_selected(True)
-            self._selected_positions.add(pos)
+        self._selected_positions = set(self._circles.keys())
+        self._refresh_styles()
         self._count_label.setText(f"{len(self._selected_positions)} selected")
         self.selection_changed.emit(list(self._selected_positions))
 
     def _on_clear_selection(self):
-        for circle in self._circles.values():
-            circle.set_selected(False)
+        if not self._interactive():
+            return
         self._selected_positions.clear()
+        self._refresh_styles()
         self._count_label.setText("0 selected")
         self.selection_changed.emit([])
 
@@ -720,15 +818,17 @@ class SampleGridWidget(QWidget):
         self._tip_label.show()
 
     def set_current_position(self, row: int, col: int):
-        """Set the currently highlighted well (e.g., after stage arrives)."""
+        """Set the currently highlighted well (e.g., after stage arrives). In
+        single-select mode this is the cyan + check 'you are here' marker."""
         pos = (row, col)
         if pos == self._current_position:
             return  # already there — avoid needless repaints / flicker
-        if self._current_position and self._current_position in self._circles:
-            self._circles[self._current_position].set_selected(False)
+        old = self._current_position
         if pos in self._circles:
             self._current_position = pos
-            self._circles[pos].set_selected(True)
+            if old and old in self._circles:
+                self._restyle(old)
+            self._restyle(pos)
             if not self._multi_select and hasattr(self, "_info_label"):
                 self._info_label.setText(f"At {well_name(row, col)}")
 
@@ -738,9 +838,9 @@ class SampleGridWidget(QWidget):
         the stage actually is."""
         if self._current_position is None:
             return
-        if self._current_position in self._circles:
-            self._circles[self._current_position].set_selected(False)
+        old = self._current_position
         self._current_position = None
+        self._restyle(old)
         if not self._multi_select and hasattr(self, "_info_label"):
             self._info_label.setText("Click a well to move stage")
 
@@ -755,8 +855,7 @@ class SampleGridWidget(QWidget):
         but the view remains scrollable/pannable.
         """
         self._grid_enabled = enabled
-        for circle in self._circles.values():
-            circle.set_disabled(not enabled)
+        self._refresh_styles()
         if not self._multi_select:
             if enabled:
                 self._info_label.setText("Click a well to move stage")

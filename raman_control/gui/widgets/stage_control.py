@@ -287,6 +287,9 @@ class StageControlWidget(QWidget):
         self._nanodrive = nanodrive
         self._nd_config = nanodrive_config or NanoDriveConfig()
         self._coord_mgr = coordinate_manager
+        # Optional absolute-move handler (physical x, y, z) set by the main
+        # window so Go moves hop over slide barriers in objective view.
+        self._move_handler = None
 
         # Current state
         self._current_position = (0.0, 0.0, 0.0)
@@ -708,7 +711,7 @@ class StageControlWidget(QWidget):
                            ('spec_prusa', 'Spec Prusa'),
                            ('spec_nano', 'Spec ND')):
             lbl = QLabel(f'{text} Focus: N/A')
-            lbl.setStyleSheet('font-size: 12px; color: #ffffff;')
+            lbl.setStyleSheet('font-size: 10px; color: #ffffff;')
             self._focus_lbls[kind] = (lbl, text)
             focus_box.addWidget(lbl)
         limits_grid.addLayout(focus_box, 0, 5, 3, 1)
@@ -855,7 +858,10 @@ class StageControlWidget(QWidget):
             # Target inputs are in logical coords — convert to physical
             if self._coord_mgr:
                 x, y, z = self._coord_mgr.logical_to_physical(x, y, z)
-            self._motion.request_move_to(x=x, y=y, z=z)
+            if self._move_handler is not None:
+                self._move_handler(x, y, z)
+            else:
+                self._motion.request_move_to(x=x, y=y, z=z)
 
             # Also move nanodrive to its target
             nd_target = self._nd_target.value()
@@ -974,6 +980,11 @@ class StageControlWidget(QWidget):
         """Widefield Prusa Z autofocus limits (upper, lower) in mm."""
         return (self._wf_z_upper.value(), self._wf_z_lower.value())
 
+    def set_move_handler(self, handler) -> None:
+        """Route Go-button moves through ``handler(phys_x, phys_y, phys_z)``
+        instead of a direct request_move_to (see MainWindow._manual_move)."""
+        self._move_handler = handler
+
     def get_objective_z_limits(self) -> tuple:
         """Objective Prusa Z autofocus limits (upper, lower) in mm."""
         return (self._obj_z_upper.value(), self._obj_z_lower.value())
@@ -992,5 +1003,9 @@ class StageControlWidget(QWidget):
         if entry is None:
             return
         lbl, text = entry
-        unit = 'µm' if kind == 'spec_nano' else 'mm'
-        lbl.setText(f'{text} Focus: {value:.3f} {unit}')
+        # Match the live XYZ / ND position readouts: 2 decimals for Prusa Z (mm),
+        # 1 decimal for the NanoDrive (µm).
+        if kind == 'spec_nano':
+            lbl.setText(f'{text} Focus: {value:.1f} µm')
+        else:
+            lbl.setText(f'{text} Focus: {value:.2f} mm')

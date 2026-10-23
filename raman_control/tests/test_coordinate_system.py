@@ -17,12 +17,18 @@ from raman_control.config.hardware_config import StageConfig
 # ---------------------------------------------------------------------------
 
 def _make_coord_mgr(offset_x=10.0, offset_y=5.0, offset_z=0.0,
-                     view=CameraView.WIDE_FOV):
-    """Create a CoordinateManager with a known test offset."""
+                     view=CameraView.WIDE_FOV, use_curve=False):
+    """Create a CoordinateManager with a known test offset.
+
+    ``use_curve`` defaults to False so these tests pin the Y offset to
+    ``offset_y`` instead of the X-dependent calibration curve (which has its
+    own tests in test_offset_calibration.py).
+    """
     config = StageConfig(
         calib_wide_to_obj_x=offset_x,
         calib_wide_to_obj_y=offset_y,
         calib_wide_to_obj_z=offset_z,
+        use_offset_calibration_curve=use_curve,
     )
     return CoordinateManager(config, initial_view=view)
 

@@ -974,7 +974,7 @@ class SpottingApp(QMainWindow):
         # Mixing parameters (enabled only when "Enable Mixing" is checked)
         self._mix_group, lay = self._section("Mixing Settings")
         self.mix_volume = self._dspin(1.0, 20.0, 5.0, step=1.0)
-        self.mix_cycles = self._spin(1, 99, 3)
+        self.mix_cycles = self._spin(1, 99, 10)
         self.mix_rate = self._dspin(0.1, 25.0, 5.0, step=0.5)
         self._row(lay, "Mix Vol (1-20 µL):", self.mix_volume)
         self._row(lay, "Mix Cycles:", self.mix_cycles)
@@ -1150,7 +1150,7 @@ class SpottingApp(QMainWindow):
 
         self.droplet_volume.setValue(val("VOL", 2.0, float))
         self.mix_volume.setValue(val("MIX_VOL", 5.0, float))
-        self.mix_cycles.setValue(val("MIX_CYCLES", 3, int))
+        self.mix_cycles.setValue(val("MIX_CYCLES", 10, int))
         self.mix_rate.setValue(val("MIX_RATE", 5.0, float))
         self.travel_speed.setValue(val("TRAVEL_SPEED", 400, int))
         self.do_mix.setChecked(bool(consts.get("ENABLE_MIX", True)))
@@ -1215,7 +1215,7 @@ class SpottingApp(QMainWindow):
 
         self.droplet_volume.setValue(2.0)
         self.mix_volume.setValue(5.0)
-        self.mix_cycles.setValue(3)
+        self.mix_cycles.setValue(10)
         self.mix_rate.setValue(5.0)
         self.travel_speed.setValue(400)
         self.do_mix.setChecked(True)
@@ -1252,6 +1252,8 @@ class SpottingApp(QMainWindow):
         prefix_row.addWidget(prefix_lbl)
         self._prefix_edit = QLineEdit("patient")
         self._prefix_edit.textChanged.connect(self._on_prefix_changed)
+        # Enter in the prefix box jumps to the first sample name.
+        self._prefix_edit.returnPressed.connect(lambda: self._focus_sample_entry(0))
         prefix_row.addWidget(self._prefix_edit, 1)
         outer.addLayout(prefix_row)
 
@@ -1266,6 +1268,7 @@ class SpottingApp(QMainWindow):
         self.sample_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(self._sample_container)
         outer.addWidget(scroll, 1)
+        self._sample_scroll = scroll
 
         return box
 
@@ -1418,6 +1421,8 @@ class SpottingApp(QMainWindow):
                 e = QLineEdit()
                 e.setPlaceholderText(f"{i + 1}")
                 e.textChanged.connect(self._update_map_names)
+                # Enter jumps to the next sample name box for fast typing.
+                e.returnPressed.connect(lambda idx=i: self._focus_sample_entry(idx + 1))
                 h.addWidget(lbl)
                 h.addWidget(prefix)
                 h.addWidget(e, 1)
@@ -1432,6 +1437,16 @@ class SpottingApp(QMainWindow):
                 row = self.sample_rows.pop()
                 row.setParent(None)
                 row.deleteLater()
+
+    def _focus_sample_entry(self, index):
+        """Move keyboard focus to sample entry `index` (if it exists), select
+        its text, and scroll it into view."""
+        if not (0 <= index < len(self.sample_entries)):
+            return
+        e = self.sample_entries[index]
+        e.setFocus(Qt.FocusReason.TabFocusReason)
+        e.selectAll()
+        self._sample_scroll.ensureWidgetVisible(e)
 
     @staticmethod
     def _split_prefix(names):

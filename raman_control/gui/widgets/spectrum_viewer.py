@@ -30,6 +30,12 @@ from raman_control.config.logging_config import get_logger
 
 logger = get_logger('spectrum_viewer')
 
+# No software cap on the spectrometer exposure time: long integrations are a
+# legitimate way to get signal out of a weak sample, so the only limit is what
+# the driver/hardware itself accepts. QSpinBox stores a 32-bit int, so its
+# maximum is the highest value the widget can physically hold.
+MAX_EXPOSURE_MS = 2147483647
+
 # Configure PyQtGraph for performance + dark theme
 pg.setConfigOptions(
     antialias=False,  # Disable antialiasing for better performance
@@ -197,8 +203,15 @@ class SpectrumViewerWidget(QWidget):
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
         # AF acquisition settings (used only during focusing, not acquisition).
-        self._af_expo = _spin(1, 100000, 100)
-        self._af_expo.setToolTip("Exposure time used during autofocus (ms)")
+        # Exposure is per scan stage: the coarse Prusa sweep is usually run
+        # short and fast, while the fine NanoDrive sweep can afford longer
+        # integrations for a cleaner score.
+        self._af_prusa_expo = _spin(1, MAX_EXPOSURE_MS, 200, width=76)
+        self._af_prusa_expo.setToolTip(
+            "Exposure time used during the Prusa (coarse) autofocus (ms)")
+        self._af_nano_expo = _spin(1, MAX_EXPOSURE_MS, 200, width=76)
+        self._af_nano_expo.setToolTip(
+            "Exposure time used during the NanoDrive (fine) autofocus (ms)")
         self._af_power = _spin(0, 450, 450)
         self._af_power.setToolTip("Laser power used during autofocus (mW)")
         self._af_reps = _spin(1, 50, 3)
@@ -212,17 +225,21 @@ class SpectrumViewerWidget(QWidget):
         # Expo/Power with unit; right group: the step boxes. Column 3 is a
         # spacer that pushes the step group to the right edge.
         _R = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        grid.addWidget(QLabel("Expo. Time:"), 0, 0, alignment=_R)
-        grid.addWidget(self._af_expo, 0, 1)
+        grid.addWidget(QLabel("Prusa expo:"), 0, 0, alignment=_R)
+        grid.addWidget(self._af_prusa_expo, 0, 1)
         grid.addWidget(QLabel("ms"), 0, 2)
         grid.addWidget(QLabel("Prusa steps:"), 0, 4, alignment=_R)
         grid.addWidget(self._af_prusa_steps, 0, 5)
 
-        grid.addWidget(QLabel("Power:"), 1, 0, alignment=_R)
-        grid.addWidget(self._af_power, 1, 1)
-        grid.addWidget(QLabel("mW"), 1, 2)
+        grid.addWidget(QLabel("Nano expo:"), 1, 0, alignment=_R)
+        grid.addWidget(self._af_nano_expo, 1, 1)
+        grid.addWidget(QLabel("ms"), 1, 2)
         grid.addWidget(QLabel("Nano steps:"), 1, 4, alignment=_R)
         grid.addWidget(self._af_nano_steps, 1, 5)
+
+        grid.addWidget(QLabel("Power:"), 2, 0, alignment=_R)
+        grid.addWidget(self._af_power, 2, 1)
+        grid.addWidget(QLabel("mW"), 2, 2)
 
         grid.setColumnStretch(3, 1)  # gap between the two field groups
         grid.setColumnMinimumWidth(3, 26)  # keep the unit clear of the steps
@@ -282,10 +299,17 @@ class SpectrumViewerWidget(QWidget):
         # Dock the panel as a fixed column on the right of the spectrum block.
         outer.addWidget(self._af_panel)
 
-    def _af_params(self) -> dict:
-        """Current Wasatch-autofocus parameters from the panel."""
+    def _af_params(self, stage: str) -> dict:
+        """Current Wasatch-autofocus parameters from the panel.
+
+        ``stage`` is 'prusa' (coarse) or 'nano' (fine); ``exposure_ms`` is that
+        stage's own exposure, since the two scans are tuned separately.
+        """
+        expo = (self._af_nano_expo if stage == 'nano'
+                else self._af_prusa_expo).value()
         return {
-            "exposure_ms": self._af_expo.value(),
+            "stage": stage,
+            "exposure_ms": expo,
             "power_mw": self._af_power.value(),
             "reps": self._af_reps.value(),
             "coarse_steps": self._af_prusa_steps.value(),
@@ -314,12 +338,12 @@ class SpectrumViewerWidget(QWidget):
     def _on_prusa_autofocus_clicked(self):
         """Request spectrometer coarse autofocus by moving the Prusa in Z."""
         self.clear_focus_plot('prusa')
-        self.prusa_autofocus_requested.emit(self._af_params())
+        self.prusa_autofocus_requested.emit(self._af_params('prusa'))
 
     def _on_nano_autofocus_clicked(self):
         """Request spectrometer fine autofocus by moving the NanoDrive."""
         self.clear_focus_plot('nano')
-        self.nanodrive_autofocus_requested.emit(self._af_params())
+        self.nanodrive_autofocus_requested.emit(self._af_params('nano'))
 
     def _setup_plot(self):
         """Create the PyQtGraph plot widget."""
@@ -518,10 +542,12 @@ class SpectrumViewerWidget(QWidget):
         ''')
 
         self._integration_spin = QSpinBox()
-        self._integration_spin.setRange(1, 10000)
+        # Uncapped on purpose (see MAX_EXPOSURE_MS): long integrations are a
+        # valid way to pull signal out of a weak sample.
+        self._integration_spin.setRange(1, MAX_EXPOSURE_MS)
         self._integration_spin.setValue(int(self._config.integration_time))
         # Width just enough for the number (text + spin arrows + frame padding).
-        _int_w = self._integration_spin.fontMetrics().horizontalAdvance("50000")
+        _int_w = self._integration_spin.fontMetrics().horizontalAdvance("1000000")
         self._integration_spin.setFixedWidth(_int_w + 32)
         self._integration_spin.valueChanged.connect(self._on_integration_changed)
 
@@ -756,6 +782,19 @@ class SpectrumViewerWidget(QWidget):
         else:
             # Not connected - reset button state
             self._laser_btn.setChecked(False)
+
+    def acquisition_exposure_ms(self) -> float:
+        """The ACQUISITION exposure (ms) shown in the spectrometer panel.
+
+        This is the value the device must sit at whenever nothing is actively
+        overriding it, so the autofocus restores to this rather than to a
+        snapshot taken when the scan started.
+        """
+        return float(self._integration_spin.value())
+
+    def acquisition_power_mw(self) -> float:
+        """The ACQUISITION laser power (mW) shown in the spectrometer panel."""
+        return float(self._power_spin.value())
 
     def _on_integration_changed(self, value: int):
         """Handle integration time change."""

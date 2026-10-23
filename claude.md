@@ -4,7 +4,7 @@
 
 Vision-guided, high-throughput Raman microscopy system for blood-based liquid biopsy. This software coordinates optical hardware, motion control, image-based feedback, and data acquisition into an automated workflow with a user-facing interface for diverse technical backgrounds.
 
-**Key Challenge**: Prevent timeout errors during data acquisition by properly managing 3D printer stage communication, thread synchronization, and GUI responsiveness.
+**Key Challenge**: Prevent timeout errors during data acquisition by properly managing 3D printer stage communication, thread synchronization, and GUI responsiveness. Make sure correct connection/communication/synchronization between devices and modules for correct functionalities.
 
 ---
 
@@ -141,6 +141,33 @@ Main GUI Thread
 - GUI updates from worker threads only via queues
 - One thread "owns" each hardware interface
 - State machine coordinates transitions
+
+### CRITICAL: Preserve Working Design Patterns from Old Software (noodlepy)
+
+When refactoring from noodlepy to raman_control, **keep all working behavior and design patterns intact** while improving architecture. The old code works with real hardware — do not break patterns that keep things responsive. Key patterns that MUST be preserved:
+
+**1. Both cameras always acquire simultaneously**
+- Each camera runs its own independent acquisition thread from the moment it connects
+- Frames are continuously pushed to per-camera queues regardless of which view is displayed
+- NEVER stop one camera's acquisition just because the user isn't looking at it
+- Dropping frames silently (non-blocking queue put) is acceptable to maintain throughput
+
+**2. View switching is display-only — instant, no hardware I/O**
+- Switching between Wide FOV and Objective view means changing which camera's frames the display widget reads
+- NEVER call blocking hardware functions (serial reads, `get_position()`, etc.) from the GUI thread during a view switch
+- NEVER show modal dialogs (QMessageBox) during routine view switching
+- Stage offset movement (if needed) is dispatched asynchronously and does NOT block the view switch
+
+**3. Never block the GUI thread with hardware communication**
+- Position data: use cached values from `position_changed` signal, never call synchronous `get_position()`
+- Stage movement: always use `request_move_to()` / `request_move_by()` (fire-and-forget command queue)
+- Camera operations: acquisition start/stop are just flag changes, not hardware calls
+- If you need fresh hardware state on the GUI thread, request it asynchronously and handle the response via signal/slot
+
+**4. SDK initialization must be serialized but not block the GUI**
+- Camera SDK init, `discover_available_cameras()`, and `open_camera()` calls must be serialized with a lock across all camera threads
+- This serialization happens on the worker threads, never on the GUI thread
+- Use ref counting for shared SDK resources (e.g., `ThorlabsCameraManager`)
 
 ### 2. 3D Printer Communication (PREVENT TIMEOUTS)
 
@@ -332,16 +359,17 @@ logger.error(f"Timeout on stepper: {error}")
 ### Wide FOV Autofocus (Closed-Loop)
 - Acquire frame → Detect focus quality → Adjust Z position (stepper/piezo)
 - Common metrics: Laplacian variance, contrast, sharpness
-- Loop until metric plateau
+- Loop within a defined range in z using prusa stage (coarse) to find the position with the best score (minimum score or maximum score)
 
 ### Spectrometer Autofocus (Closed-Loop)
 - Acquire spectrum → Fit peak intensity → Adjust Z position (piezo fine)
-- Use intensity gradient to find optimum
-- Faster than image-based due to fewer degrees of freedom
-
+- Use intensity ratio between two defined Raman shift to find optimal focus
+- loop within a defined range in z using prusa stage (coarse) and nanodrive (fine) to find the position with the best score (minimum score or maximum score)
 
 ## Checklist for Implementation
 
+- [ ] Proper initialization of all devices
+- [ ] Keep all the functionalities from the old version but make the communication between different modules/devices more efficient and less error prone
 - [ ] Serial communication with proper timeout handling
 - [ ] Dedicated motion control thread with command queue
 - [ ] GUI thread with PyQt6 + signal/slot pattern
@@ -385,6 +413,18 @@ logger.error(f"Timeout on stepper: {error}")
 
 8. **❌ Outdated imaging libraries (old OpenCV, old Qt)**
    - ✅ Use modern versions (OpenCV 4.x, PyQt6, Vispy/PyQtGraph)
+
+9. **❌ Stopping/starting camera acquisition on view switch**
+   - ✅ Both cameras always acquire. View switch just changes which frames are displayed.
+
+10. **❌ Calling `get_position()` or any serial I/O from GUI thread**
+    - ✅ Cache position via `position_changed` signal. Use `request_move_to()` for movement.
+
+11. **❌ Showing QMessageBox/modal dialogs during routine operations**
+    - ✅ Reserve modal dialogs for destructive actions only (homing, exit). View switching should be instant.
+
+12. **❌ Breaking old working patterns during refactor**
+    - ✅ Study the old noodlepy code first. If a pattern works with real hardware, preserve it. Refactor the structure, not the behavior.
 
 ---
 

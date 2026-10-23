@@ -20,7 +20,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 
 from raman_control.core.state_machine import AcquisitionStateMachine
-from raman_control.gui.threads.acquisition_thread import AcquisitionWorker
+from raman_control.gui.threads.acquisition_thread import (
+    AcquisitionWorker, all_conditions_per_point, prusa_af_plan,
+    repeat_conditions)
 from raman_control.gui.widgets.sample_grid import SampleGridWidget
 from raman_control.gui.widgets.live_view import (
     ClickableLabel, CYAN_OUTLINE_BTN_STYLE)
@@ -28,6 +30,19 @@ from raman_control.gui.styles import COLORS
 from raman_control.config.logging_config import get_logger
 
 logger = get_logger('protocol_panel')
+
+
+class _WrapLabel(QLabel):
+    """A word-wrapping QLabel that emits ``clicked`` when pressed, so it can act
+    as the (wrapping) text for a textless QCheckBox — QCheckBox can't word-wrap
+    its own label, so a long label is shown by this label beside the box."""
+
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class StateIndicator(QLabel):
@@ -123,6 +138,15 @@ class ProtocolPanelWidget(QWidget):
         # Guard against recursion when syncing the linked Z ranges.
         self._linking = False
 
+        # Step-cursor pacing: the worker fires status updates faster than the
+        # preview can repaint, so near-instant steps (LED off, generate, view
+        # switch) would be overwritten before they're seen. Queue cursor moves
+        # and apply them with a brief minimum dwell so each step is visible.
+        self._highlight_queue: list = []
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.timeout.connect(self._advance_highlight)
+
         # Build UI
         self._setup_ui()
         self._connect_signals()
@@ -137,6 +161,10 @@ class ProtocolPanelWidget(QWidget):
         if self._live_view is not None and hasattr(self._live_view, 'point_edit_mode_changed'):
             self._live_view.point_edit_mode_changed.connect(
                 self._on_fov_edit_mode_changed)
+        # Keep the FoV preview mirroring the Live tab's composite (so the green
+        # current-acquisition point shows here too).
+        if self._live_view is not None and hasattr(self._live_view, 'capture_overlay_changed'):
+            self._live_view.capture_overlay_changed.connect(self._refresh_fov_view)
 
         # Re-pull + re-gate Start when the user registers the autofocus ranges.
         if (self._stage_control is not None
@@ -175,7 +203,8 @@ class ProtocolPanelWidget(QWidget):
         'wf_z_upper': 'mm', 'wf_z_lower': 'mm',
         'obj_z_upper': 'mm', 'obj_z_lower': 'mm',
         'nano_upper': 'µm', 'nano_lower': 'µm',
-        'spec_af_exposure': 'ms', 'spec_af_power': 'mW',
+        'spec_af_prusa_exposure': 'ms', 'spec_af_nano_exposure': 'ms',
+        'spec_af_power': 'mW',
         'grid_buffer': 'µm', 'ring_interval': 'µm', 'ring_buffer': 'µm',
         'line_buffer': 'µm',
     }
@@ -200,6 +229,30 @@ class ProtocolPanelWidget(QWidget):
             box.addWidget(lbl)
         box.addStretch()
         return box
+
+    def _wrapping_checkbox(self, text, tooltip='', checked=False):
+        """A checkbox whose long label wraps to multiple rows within the narrow
+        left column. QCheckBox can't word-wrap its own text, so the box carries
+        no text and a word-wrapping label beside it shows ``text`` (clicking the
+        label toggles the box). Returns ``(row_widget, checkbox)`` — add the row
+        to the layout and keep the checkbox for state."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        cb = QCheckBox()
+        cb.setChecked(checked)
+        lbl = _WrapLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        lbl.clicked.connect(cb.toggle)
+        if tooltip:
+            cb.setToolTip(tooltip)
+            lbl.setToolTip(tooltip)
+        # Top-align the indicator so it sits beside the first wrapped line.
+        h.addWidget(cb, 0, Qt.AlignmentFlag.AlignTop)
+        h.addWidget(lbl, 1)
+        return row, cb
 
     def _mirror(self, grid, row, key, label, get_target, read_only=False):
         """Add a local spin box mirroring a Live-tab spin box; register a
@@ -542,17 +595,169 @@ class ProtocolPanelWidget(QWidget):
 
         return panel
 
+    # --- protocol time estimate ---------------------------------------------
+    # Rough per-step durations (seconds) for the hardware-timing pieces that
+    # aren't captured by the numeric settings (stage moves, settle, readout,
+    # U-Net). The exposure / step-count driven parts are computed from the actual
+    # parameters, so the estimate tracks the options. Calibrated against a real
+    # 3-droplet x 3-point Robotic run (~180 s) with: widefield AF 5 steps,
+    # spectrometer Prusa AF 10 steps, NanoDrive AF 10 steps, AF exposure 100 ms,
+    # AF reps 3, acquire 3 x 1000 ms. It is approximate, not a guarantee.
+    _EST_MOVE_DROPLET = 2.5    # stage XY move to a droplet
+    _EST_MOVE_POINT = 1.0      # stage move to a sample point (within the FoV)
+    _EST_VIEW_SWITCH = 2.5     # widefield <-> objective offset move
+    _EST_LED = 0.5             # illumination LED on + settle
+    _EST_SEGMENT = 2.5         # U-Net segmentation of a droplet
+    _EST_CAM_AF_STEP = 0.1     # per widefield-AF Z step beyond its settle (move+score)
+    _EST_PRUSA_AF_STEP = 0.1   # per spectrometer-Prusa AF Z step (move + settle)
+    _EST_NANO_AF_STEP = 0.05   # per spectrometer-NanoDrive AF Z step (move + settle)
+    _EST_FRAME = 0.03          # per spectrum beyond its exposure (readout/transfer)
+    _EST_SAVE = 0.1            # write one spectrum file
+    _EST_LASER_WARMUP = 5.0    # one-time, at the first measured point
+
+    def _measure_point_seconds(self, p, conds) -> float:
+        """Estimated seconds to measure one sample point (autofocus + acquire)
+        acquiring every repeat condition in ``conds`` (dicts from
+        repeat_conditions) after one round of autofocus / photobleaching."""
+        af_reps = max(1, int(p.get('spec_af_reps') or 1))
+        # Each scored Z step acquires af_reps spectra (exposure + readout), at
+        # that scan's own autofocus exposure.
+        nano_expo = float(p.get('spec_af_nano_exposure') or 0) / 1000.0
+        nano_af_spectrum = af_reps * (nano_expo + self._EST_FRAME)
+        t = self._EST_MOVE_POINT
+        # Prusa scans at a point that is NOT the first of its sample (the first
+        # point's extra scans are in _sample_prusa_af_seconds).
+        t += self._prusa_scans(p, False) * self._prusa_af_seconds(p)
+        if p.get('wait_before_measure'):
+            t += float(p.get('wait_time_s') or 0)
+        # Acquisition of every condition: each condition's reps at its own
+        # exposure, one saved file per condition.
+        acq = sum(int(c['reps_per_point'])
+                  * (float(c['exposure_ms']) / 1000.0 + self._EST_FRAME
+                     + self._EST_SAVE)
+                  for c in conds)
+        if p.get('z_stack'):
+            z = max(2, int(p.get('spec_af_fine') or 10))
+            t += z * (self._EST_NANO_AF_STEP + acq)
+        else:
+            if p.get('autofocus_wasatch_nanodrive'):
+                steps = max(2, int(p.get('spec_af_fine') or 10))
+                t += steps * (self._EST_NANO_AF_STEP + nano_af_spectrum)
+            t += acq
+        return t
+
+    @staticmethod
+    def _condition_passes(p) -> list:
+        """The protocol passes over all points, each as the list of repeat
+        conditions acquired at every point in that pass: one pass per repeat,
+        or a single pass with every condition when all conditions are completed
+        per point."""
+        conds = repeat_conditions(p)
+        if all_conditions_per_point(p):
+            return [conds]
+        return [[c] for c in conds]
+
+    def _prusa_af_seconds(self, p) -> float:
+        """Estimated seconds for ONE spectrometer Prusa autofocus scan."""
+        af_reps = max(1, int(p.get('spec_af_reps') or 1))
+        prusa_expo = float(p.get('spec_af_prusa_exposure') or 0) / 1000.0
+        steps = max(2, int(p.get('spec_af_coarse') or 20))
+        return steps * (self._EST_PRUSA_AF_STEP
+                        + af_reps * (prusa_expo + self._EST_FRAME))
+
+    @staticmethod
+    def _prusa_scans(p, first_in_sample: bool) -> int:
+        """Number of Prusa spectrometer AF scans at one point (before and
+        after its photobleach), per prusa_af_plan."""
+        plan = prusa_af_plan(p, first_in_sample)
+        return int(plan.before_bleach) + int(plan.after_bleach)
+
+    def _sample_prusa_af_seconds(self, p) -> float:
+        """Estimated EXTRA seconds of Prusa autofocus at a sample's first
+        point (the scans the other points of the sample skip)."""
+        extra = self._prusa_scans(p, True) - self._prusa_scans(p, False)
+        return max(0, extra) * self._prusa_af_seconds(p)
+
+    def _camera_af_seconds(self, p) -> float:
+        """Estimated seconds for the widefield camera autofocus scan (each Z step
+        settles for the configured camera-AF settle time, then scores a frame)."""
+        if not p.get('autofocus_widefield_prusa'):
+            return 0.0
+        steps = max(2, int(p.get('cam_af_steps') or 20))
+        wf = getattr(self._live_view, '_widefield_config', None)
+        settle = float(getattr(wf, 'af_settle_time', 1.0) or 1.0)
+        return steps * (settle + self._EST_CAM_AF_STEP)
+
+    def _estimate_seconds(self, p, current_fov: bool, n_outer: int,
+                          ppd: int) -> float:
+        """Estimated total run time (seconds). n_outer = sample points (Current
+        FoV) or droplets (Robotic); ppd = points per droplet (Robotic)."""
+        passes = self._condition_passes(p)
+        point_ts = [self._measure_point_seconds(p, cs) for cs in passes]
+        sample_af_t = self._sample_prusa_af_seconds(p)
+        if current_fov:
+            # Widefield AF + view switches happen once; then every point. The
+            # whole FoV is one sample (per-sample AF once per pass).
+            return (2 * self._EST_VIEW_SWITCH + self._camera_af_seconds(p)
+                    + self._EST_LASER_WARMUP
+                    + sum(sample_af_t + n_outer * pt for pt in point_ts))
+        # Robotic: per-droplet image + segment + generate, then its points.
+        wf = getattr(self._live_view, '_widefield_config', None)
+        cam_capture = float(getattr(wf, 'af_capture_stabilization_time', 1.5) or 1.5)
+        # Centering runs 2-3 recenter passes per droplet, each a move + settle +
+        # re-capture + segmentation. Estimate the minimum (2 passes).
+        center_passes = 2
+        center_t = (center_passes
+                    * (cam_capture + self._EST_SEGMENT + self._EST_MOVE_POINT)
+                    if p.get('center_sample') else 0.0)
+        # Per-droplet widefield capture work (move, AF, capture, segment, center).
+        capture_t = (self._EST_MOVE_DROPLET + self._EST_LED
+                     + self._camera_af_seconds(p) + cam_capture
+                     + self._EST_SEGMENT + center_t)
+        # Measuring one droplet (a sample) in each pass.
+        measure_ts = [sample_af_t + ppd * pt for pt in point_ts]
+        if p.get('capture_upfront'):
+            # Capture every droplet ONCE (each with its widefield<->objective
+            # framing), switch to the objective a single time, then measure
+            # every droplet in each pass.
+            return (self._EST_LASER_WARMUP
+                    + n_outer * (self._EST_VIEW_SWITCH + capture_t)
+                    + self._EST_VIEW_SWITCH
+                    + sum(n_outer * mt for mt in measure_ts))
+        # Interleaved: every droplet is captured AND measured in each pass,
+        # switching widefield<->objective per droplet.
+        return self._EST_LASER_WARMUP + sum(
+            n_outer * (2 * self._EST_VIEW_SWITCH + capture_t + mt)
+            for mt in measure_ts)
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Compact '~H h M min' / '~M min S s' / '~S s' for the estimate."""
+        s = max(0, int(round(seconds)))
+        if s < 60:
+            return f"~{s} s"
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return f"~{m} min" + (f" {sec} s" if sec else "")
+        h, m = divmod(m, 60)
+        return f"~{h} h" + (f" {m} min" if m else "")
+
     def _refresh_preview(self):
         """Rebuild the step list so it matches what the acquisition worker will
         actually execute.
 
-        Key points (these caused confusion before):
-        - The widefield-camera autofocus runs ONCE, before the point loop, not
-          per point.
-        - Current FoV measures EVERY generated sample point (the ring/grid/...
-          pattern you set), so the preview enumerates them.
+        Both modes use ONE layout: a header, a 'Setup'/'Process' section, then an
+        'End of run' section. Steps are bulleted and indented under their sample
+        (Current FoV: each [point N/M]; Robotic: each Droplet, with a nested
+        'measure each point' block). The per-point measurement steps come from
+        the shared ``measure_steps`` so both modes read identically.
         """
         if not hasattr(self, '_preview_text'):
+            return
+        # Frozen during a run: the preview reflects what is actually executing,
+        # so the step cursor advances on a stable list (and a stray live-view
+        # update can't rebuild it into the wrong mode mid-acquisition).
+        if getattr(self, '_cfov_running', False):
             return
         # Keep the Data Save file-name format in sync with the current pattern.
         self._update_filename_format()
@@ -561,60 +766,96 @@ class ProtocolPanelWidget(QWidget):
         p = self.get_acquisition_parameters()
         mode = p['acquisition_mode']
         repeats = p['repeat_each_sample']
-        reps_per_point = p['reps_per_point']
+        # Spectrum settings per repeat ("conditions"; all equal unless per-
+        # repeat settings are on). With 'complete all conditions per point' the
+        # protocol runs ONCE and every condition is acquired at each point.
+        conds = repeat_conditions(p)
+        all_pp = all_conditions_per_point(p)
+        outer = 1 if all_pp else repeats
         # Z-stack: number of NanoDrive Z positions (>=2). The worker acquires
-        # reps_per_point spectra at EACH Z step, so the preview enumerates them.
+        # each condition's reps per point at EACH Z step, so the preview
+        # enumerates them.
         z_stack = bool(p['z_stack'])
         z_steps = max(2, int(p.get('spec_af_fine') or 10)) if z_stack else 0
-        expo = self._binding_value('acq_exposure')
-        power = self._binding_value('acq_power')
-        expo_s = f"{expo} ms" if expo is not None else "exposure"
-        power_s = f"{power} mW" if power is not None else "power"
-
-        # Per-point autofocus (the widefield/Prusa one is handled once, below).
-        per_point_af = []
-        if p['autofocus_wasatch_prusa']:
-            per_point_af.append("Autofocus Wasatch with Prusa")
-        if p['autofocus_wasatch_nanodrive'] and not p['z_stack']:
-            per_point_af.append("Autofocus Wasatch with NanoDrive")
-
         warmup_s = int(AcquisitionWorker._LASER_WARMUP_S)
+        # Spectra per point over the whole run (every condition).
+        spectra_per_point = (sum(c['reps_per_point'] for c in conds)
+                             * (z_steps if z_stack else 1))
+        SEP = "-" * 34
 
-        def emit_point(lines, n, label, first=False):
-            """Append the per-point steps; return the updated step counter.
+        def cond_s(c):
+            return f"{c['exposure_ms']:g} ms, {c['power_mw']:g} mW"
 
-            ``first`` marks the first point of the whole run, where the laser is
-            switched on (with a one-time warm-up wait) before any spectrometer
-            work — it then stays on until the end of the run."""
-            lines.append(f"[{label}]")
-            n += 1
-            lines.append(f"  {n}. Move to {label}")
+        cond_lines = []
+        if p.get('repeat_conditions_enabled') or all_pp:
+            cond_lines.append("Repeat conditions:")
+            for k, c in enumerate(conds):
+                cond_lines.append(f"  {k + 1}: {cond_s(c)}, "
+                                  f"x{c['reps_per_point']} per point")
+            if all_pp:
+                cond_lines.append(
+                    "All conditions acquired at each point (autofocus + "
+                    "photobleach once per point), then the next point.")
+
+        def measure_steps(move_label, first, first_in_sample=True, rep=0):
+            """The per-point measurement steps (shared by both modes so they read
+            the same). Order mirrors the worker: spectrometer-Prusa autofocus,
+            photobleach, then the NanoDrive autofocus / z-stack and acquisition.
+            ``first`` adds the one-time laser warm-up at the run's first point.
+            ``first_in_sample`` picks the Prusa scans (prusa_af_plan); a scan
+            that only the sample's first point runs is labelled as such.
+            ``rep`` picks the repeat's condition (all of them when every
+            condition is completed per point)."""
+            plan = prusa_af_plan(p, first_in_sample)
+            later = prusa_af_plan(p, False)  # a non-first point of the sample
+            steps = [f"Move to {move_label}"]
             if first:
-                n += 1
-                lines.append(f"  {n}. Turn laser on (warm up {warmup_s} s, once)")
-            for af in per_point_af:
-                n += 1
-                lines.append(f"  {n}. {af}")
-            if z_stack:
-                # Z-stack owns the measurement: at each Z step the worker
-                # acquires + saves reps_per_point spectra (no separate
-                # photobleach / acquire / save steps).
-                for zi in range(z_steps):
-                    n += 1
-                    lines.append(
-                        f"  {n}. Z-step {zi + 1}/{z_steps}: NanoDrive Z, acquire "
-                        f"+ save {reps_per_point} spectra  ({expo_s}, {power_s})")
-                return n
+                steps.append(f"Turn laser on (warm up {warmup_s} s, once)")
+            if plan.before_bleach:
+                note = ("" if later.before_bleach
+                        else " (first point of sample, Z reused for the rest)")
+                steps.append(f"Autofocus spectrometer with Prusa{note}")
             if p['wait_before_measure']:
-                n += 1
-                lines.append(f"  {n}. Photobleach {p['wait_time_s']} s with laser on")
-            for k in range(reps_per_point):
-                n += 1
-                lines.append(f"  {n}. Acquire spectrum {k + 1}/{reps_per_point}"
-                             f"  ({expo_s}, {power_s})")
-            n += 1
-            lines.append(f"  {n}. Save data")
-            return n
+                steps.append(f"Photobleach {p['wait_time_s']} s with laser on")
+                # After bleaching, re-focus the Prusa (the bleach can drift the
+                # focus).
+                if plan.after_bleach:
+                    note = "" if later.after_bleach else ", first point of sample"
+                    steps.append("Autofocus spectrometer with Prusa "
+                                 f"(after photobleach{note})")
+            here = (list(range(len(conds))) if all_pp
+                    else [min(rep, len(conds) - 1)])
+            n = len(conds)
+            if z_stack:
+                for zi in range(z_steps):
+                    for k in here:
+                        c = conds[k]
+                        ctag = f", condition {k + 1}/{n}" if all_pp else ""
+                        steps.append(
+                            f"Z-step {zi + 1}/{z_steps}{ctag}: NanoDrive Z, "
+                            f"acquire + save {c['reps_per_point']} spectra  "
+                            f"({cond_s(c)})")
+            else:
+                if p['autofocus_wasatch_nanodrive']:
+                    steps.append("Autofocus spectrometer with NanoDrive")
+                for k in here:
+                    c = conds[k]
+                    if all_pp:
+                        steps.append(
+                            f"Condition {k + 1}/{n}: acquire spectrum "
+                            f"x{c['reps_per_point']}  ({cond_s(c)}), save data")
+                    else:
+                        steps.append(f"Acquire spectrum x{c['reps_per_point']}"
+                                     f"  ({cond_s(c)})")
+                        steps.append("Save data")
+            return steps
+
+        if not z_stack:
+            zinfo = ""
+        elif len({c['reps_per_point'] for c in conds}) == 1:
+            zinfo = f"  ({z_steps} Z x {conds[0]['reps_per_point']}/Z)"
+        else:
+            zinfo = f"  ({z_steps} Z steps)"
 
         if mode == 'Current FoV':
             npts = self._current_fov_point_count()
@@ -624,51 +865,46 @@ class ProtocolPanelWidget(QWidget):
                     "Capture an image, run segmentation, and generate sample "
                     "points (your Sample Pattern) in the Live tab.")
                 return
-            spectra_per_point = reps_per_point * (z_steps if z_stack else 1)
-            zinfo = f"  ({z_steps} Z × {reps_per_point}/Z)" if z_stack else ""
+            est = self._fmt_duration(
+                self._estimate_seconds(p, current_fov=True, n_outer=npts, ppd=npts))
             lines = [
                 "Mode: Current FoV",
-                f"Sample points: {npts}",
-                f"Protocol repeats: {repeats}",
-                f"Total spectra to save: {repeats * npts * spectra_per_point}"
-                + zinfo,
-                "",
+                f"Sample points: {npts}   |   Protocol repeats: {repeats}   |   "
+                f"Total spectra: {npts * spectra_per_point}{zinfo}",
+                f"Estimated time: {est}",
+                *cond_lines,
+                SEP,
+                "Setup (once):",
+                "  - Switch to widefield view",
             ]
-            n = 0
-            n += 1
-            lines.append(f"  {n}. Switch to widefield view")
             if p['autofocus_widefield_prusa']:
-                n += 1
-                lines.append(f"  {n}. Turn on illumination LED")
-                n += 1
-                lines.append(f"  {n}. Autofocus widefield camera with Prusa (once)")
-                n += 1
-                lines.append(f"  {n}. Turn off illumination LED")
-            n += 1
-            lines.append(f"  {n}. Switch to objective view (Raman is collected "
-                         "through it)")
-            for rep in range(repeats):
-                if repeats > 1:
-                    lines.append(f"=== Protocol repeat {rep + 1}/{repeats} "
-                                 "(all points) ===")
+                lines += ["  - Turn on illumination LED",
+                          "  - Autofocus widefield camera (Prusa)",
+                          "  - Turn off illumination LED"]
+            lines.append("  - Switch to objective view (Raman collected through it)")
+            lines += ["", "Measure each sample point:"]
+            for rep in range(outer):
+                if outer > 1:
+                    lines.append(f"  === Protocol repeat {rep + 1}/{repeats} ===")
                 for pi in range(npts):
-                    n = emit_point(lines, n, f"point {pi + 1}/{npts}",
-                                   first=(rep == 0 and pi == 0))
-                lines.append("")
-            n += 1
-            lines.append(f"  {n}. Turn laser off (end of run)")
-            n += 1
-            lines.append(f"  {n}. Run complete (return to capture center, "
-                         "Live controls restored)")
-            header = f"Total steps: {n}\n" + "-" * 30 + "\n"
-            self._set_preview_text(header + "\n".join(lines))
+                    lines.append(f"  [point {pi + 1}/{npts}]")
+                    # First-point-only Prusa scans run at the first point of
+                    # the sample (here the whole FoV, re-focused each repeat).
+                    for s in measure_steps(f"point {pi + 1}/{npts}",
+                                           first=(rep == 0 and pi == 0),
+                                           first_in_sample=(pi == 0),
+                                           rep=rep):
+                        lines.append(f"      - {s}")
+            lines += ["", "End of run:",
+                      "  - Turn laser off",
+                      "  - Run complete (return to capture center, "
+                      "Live controls restored)"]
+            self._set_preview_text("\n".join(lines))
             return
 
         # --- Robotic Deposition ---
-        # Droplet -> points hierarchy shown with indentation. Each droplet is
-        # imaged + segmented at run time, so points/droplet is exact for
-        # line/random and an upper bound for grid/ring (only points inside the
-        # droplet's shape are kept).
+        # Same layout; the extra droplet level (imaged + segmented at run time)
+        # nests a 'measure each point' block inside each droplet.
         wells = [well_name(r, c)
                  for (r, c) in self._sample_grid.get_selected_positions()]
         if not wells:
@@ -681,70 +917,98 @@ class ProtocolPanelWidget(QWidget):
         ptype = self.selected_pattern_type().capitalize()
         upto = "" if exact else "up to "
         shape_note = "" if exact else " (max; actual depends on each droplet's shape)"
-        spectra_per_point = reps_per_point * (z_steps if z_stack else 1)
-        total = len(wells) * repeats * ppd * spectra_per_point
+        total = len(wells) * ppd * spectra_per_point
+        est = self._fmt_duration(self._estimate_seconds(
+            p, current_fov=False, n_outer=len(wells), ppd=ppd))
+        center = bool(p.get('center_sample'))
+        upfront = bool(p.get('capture_upfront'))
 
-        def point_substeps(indent, include_laser):
-            """The per-generated-point measurement block (mirrors the worker)."""
-            sub = [f"{indent}- Move to point"]
-            if include_laser:
-                sub.append(f"{indent}- Turn laser on (warm up {warmup_s} s) "
-                           "(first point of the whole run only)")
-            if p['autofocus_wasatch_prusa']:
-                sub.append(f"{indent}- Autofocus Wasatch (Prusa)")
-            if z_stack:
-                # At each Z step the worker acquires + saves reps_per_point
-                # spectra (no separate nano-AF / photobleach / acquire / save).
-                for zi in range(z_steps):
-                    sub.append(f"{indent}- Z-step {zi + 1}/{z_steps}: NanoDrive "
-                               f"Z, acquire + save {reps_per_point} spectra")
-                return sub
-            if p['autofocus_wasatch_nanodrive']:
-                sub.append(f"{indent}- Autofocus Wasatch (NanoDrive)")
-            if p['wait_before_measure']:
-                sub.append(f"{indent}- Photobleach {p['wait_time_s']} s with laser on")
-            sub.append(f"{indent}- Acquire spectrum ×{reps_per_point} "
-                       f"({expo_s}, {power_s})")
-            sub.append(f"{indent}- Save data")
-            return sub
+        def droplet_widefield_steps(name):
+            """The widefield steps for one droplet: move, AF, capture,
+            (optional center + re-capture), segment, generate. LED stays on
+            from capture through the re-capture, then off before segmenting.
+            Mirrors the worker's per-droplet widefield phase."""
+            ds = ["Switch to widefield view",
+                  f"Move to droplet {name}",
+                  "Turn on illumination LED"]
+            if p['autofocus_widefield_prusa']:
+                ds.append("Autofocus widefield camera (Prusa)")
+            ds.append("Capture image")
+            if center:
+                ds += ["Center stage on droplet (2-3 passes, re-capture each)"]
+            ds += ["Turn off illumination LED",
+                   "Segment droplet",
+                   f"Generate {ptype} points ({upto}{ppd})"]
+            return ds
+
+        intro = ("Each droplet is imaged + segmented at run time, then its "
+                 "pattern is generated.")
+        if center:
+            intro += (" Centered: the stage recenters on each droplet before "
+                      "generating points (only the final images are saved).")
+        if upfront:
+            intro += (" Upfront: ALL droplets are captured first, then measured "
+                      "in the objective view without switching back.")
 
         lines = [
             "Mode: Robotic Deposition",
-            f"Selected droplets: {len(wells)}      Protocol repeats: {repeats}",
+            f"Droplets: {len(wells)}   |   Protocol repeats: {repeats}   |   "
+            f"Total spectra: {upto}{total}{zinfo}",
             f"Pattern: {ptype}, {upto}{ppd} points/droplet{shape_note}",
-            f"Total spectra: {upto}{total}  "
-            f"({len(wells)} droplets × {repeats} reps × {ppd} pts × "
-            + (f"{z_steps} Z × {reps_per_point}/Z)" if z_stack
-               else f"{reps_per_point}/pt)"),
-            "Each droplet is imaged + segmented at run time, then the pattern "
-            "is generated on it.",
-            "-" * 30,
+            f"Estimated time: {upto}{est}   (segmentation + stage moves are "
+            "approximate)",
+            intro,
+            *cond_lines,
+            SEP,
         ]
-        for rep in range(repeats):
-            if repeats > 1:
-                lines.append(f"=== Protocol repeat {rep + 1}/{repeats} ===")
+
+        if upfront:
+            # Phase 1: capture every droplet once (widefield). Phase 2: measure
+            # every droplet in the objective view, repeated per protocol repeat.
+            lines.append("Phase 1 - capture every droplet (widefield):")
             for di, name in enumerate(wells):
-                lines.append(f"Droplet {name}:")
-                dsteps = ["Switch to widefield view",
-                          f"Move to droplet {name}",
-                          "Turn on illumination LED"]
-                if p['autofocus_widefield_prusa']:
-                    dsteps.append("Autofocus widefield camera (Prusa)")
-                # Order mirrors the worker: capture (LED on) -> LED off ->
-                # segment -> generate -> switch to objective.
-                dsteps += ["Capture image", "Turn off illumination LED",
-                           "Segment droplet",
-                           f"Generate {ptype} points ({upto}{ppd})",
-                           "Switch to objective view"]
-                for i, txt in enumerate(dsteps, 1):
-                    lines.append(f"    {i}. {txt}")
-                lines.append(f"        For each generated point ({upto}{ppd}):")
-                lines.extend(point_substeps("            ",
-                                            rep == 0 and di == 0))
-                lines.append("")
-        lines += ["End of run:",
-                  "    Turn laser off",
-                  "    Run complete (Live controls restored)"]
+                lines.append(f"  Droplet {name}:")
+                for s in droplet_widefield_steps(name):
+                    lines.append(f"      - {s}")
+            lines += ["",
+                      "  - Turn laser off / LED stays off",
+                      "  - Switch to objective view (once)",
+                      "",
+                      "Phase 2 - measure every droplet (objective):"]
+            for rep in range(outer):
+                if outer > 1:
+                    lines.append(f"  === Protocol repeat {rep + 1}/{repeats} ===")
+                for di, name in enumerate(wells):
+                    lines.append(f"  Droplet {name}:")
+                    lines.append(
+                        f"      Measure each generated point ({upto}{ppd}):")
+                    # Generic point: list every scan, the first-point-only
+                    # ones labelled as such.
+                    for s in measure_steps("point",
+                                           first=(rep == 0 and di == 0),
+                                           first_in_sample=True, rep=rep):
+                        lines.append(f"          - {s}")
+        else:
+            lines.append("Process each droplet:")
+            for rep in range(outer):
+                if outer > 1:
+                    lines.append(f"  === Protocol repeat {rep + 1}/{repeats} ===")
+                for di, name in enumerate(wells):
+                    lines.append(f"  Droplet {name}:")
+                    for s in droplet_widefield_steps(name):
+                        lines.append(f"      - {s}")
+                    lines.append("      - Switch to objective view")
+                    lines.append(
+                        f"      Measure each generated point ({upto}{ppd}):")
+                    # Generic point: list every scan, the first-point-only
+                    # ones labelled as such.
+                    for s in measure_steps("point",
+                                           first=(rep == 0 and di == 0),
+                                           first_in_sample=True, rep=rep):
+                        lines.append(f"          - {s}")
+        lines += ["", "End of run:",
+                  "  - Turn laser off",
+                  "  - Run complete (Live controls restored)"]
         self._set_preview_text("\n".join(lines))
 
     # --- live step highlighting ---------------------------------------------
@@ -753,31 +1017,50 @@ class ProtocolPanelWidget(QWidget):
         self._preview_plain = text
         self._highlight_idx = -1
         self._highlight_block = None  # forget the sticky per-droplet/point scope
+        if hasattr(self, '_highlight_queue'):
+            self._clear_highlight_queue()  # queued indices are now stale
         self._render_preview()
 
     def _render_preview(self):
         """Render the step preview, drawing a cyan ▶ on the current step (if
-        any). Plain text when nothing is highlighted."""
+        any). Plain text when nothing is highlighted.
+
+        Setting the text/HTML resets the scrollbars to the top, so the current
+        scroll position is captured first and restored afterwards — advancing the
+        step cursor updates the highlight in place without yanking the view back
+        to the top (the user can scroll freely while a run progresses)."""
         import html as _html
+        vbar = self._preview_text.verticalScrollBar()
+        hbar = self._preview_text.horizontalScrollBar()
+        v, h = vbar.value(), hbar.value()
+
         text = getattr(self, '_preview_plain', '')
         idx = getattr(self, '_highlight_idx', -1)
         lines = text.split("\n")
-        if not (0 <= idx < len(lines)):
-            self._preview_text.setPlainText(text)
-            return
         cyan = COLORS['accent_primary']
+        default = COLORS['text_primary']
+        # Always render via setHtml (never setPlainText): setPlainText inherits
+        # the text cursor's current char format, so after a highlighted (cyan)
+        # render it would colour the WHOLE block cyan — e.g. every step turning
+        # cyan when a run is stopped. The <pre> carries the explicit default
+        # colour so unhighlighted lines are always the normal colour, and only
+        # the active line's <span> is cyan.
         out = []
         for i, ln in enumerate(lines):
             esc = _html.escape(ln)
-            if i == idx:
+            if 0 <= idx < len(lines) and i == idx:
                 out.append(f'<span style="color:{cyan}; font-weight:bold;">'
                            f'▶ {esc}</span>')
             else:
                 out.append(esc)
         self._preview_text.setHtml(
-            "<pre style='margin:0; white-space:pre-wrap; "
-            "font-family:\"Segoe UI\"; font-size:13px;'>"
+            f"<pre style='margin:0; white-space:pre-wrap; "
+            f"font-family:\"Segoe UI\"; font-size:13px; color:{default};'>"
             + "\n".join(out) + "</pre>")
+
+        # Restore the scroll position (clamped by the bar to its new range).
+        vbar.setValue(v)
+        hbar.setValue(h)
 
     # Map a worker status/progress message (substring, lowercase) to a preview
     # line (substring, lowercase). First match wins, so order by specificity.
@@ -788,14 +1071,29 @@ class ProtocolPanelWidget(QWidget):
         ('led on', 'turn on illumination led'),
         ('widefield autofocus', 'autofocus widefield camera'),
         ('autofocusing widefield', 'autofocus widefield camera'),
+        # Before the generic 'capture' rule: centering recaptures after the move.
+        ('centering', 'center stage on droplet'),
         ('capture image', 'capture image'),
         ('segment', 'segment droplet'),
         ('generate', 'generate '),
-        ('wasatch autofocus (nanodrive)', 'autofocus wasatch (nanodrive)'),
-        ('wasatch autofocus (prusa)', 'autofocus wasatch (prusa)'),
+        ('spectrometer autofocus (nanodrive)', 'spectrometer with nanodrive'),
+        # The post-photobleach Prusa AF: match it BEFORE the generic Prusa rule
+        # (its message also contains 'spectrometer autofocus (prusa)') so it lands
+        # on its own preview line, not the pre-bleach one.
+        ('after photobleach', 'prusa (after photobleach)'),
+        ('spectrometer autofocus (prusa)', 'spectrometer with prusa'),
+        # Before the laser rules: the photobleach message contains 'laser on'.
+        ('photobleach', 'photobleach'),
         ('warming up', 'turn laser on'),
         ('laser on', 'turn laser on'),
         ('laser off', 'turn laser off'),
+        # The PER-POINT move ("Moving to <point>") must target the point step,
+        # not the droplet move: a Robotic droplet block has BOTH "Move to droplet"
+        # and "Move to point", and the generic 'move to' below would land on the
+        # first (the droplet), flashing the cursor back each point. The droplet
+        # move itself is "Droplet B5: moving" (no "moving to"), so it still uses
+        # the generic rule.
+        ('moving to', 'move to point'),
         ('moving', 'move to'),
         ('acquiring', 'acquire spectrum'),
         # Before 'saved': the completion message ends with "spectra saved".
@@ -820,8 +1118,15 @@ class ProtocolPanelWidget(QWidget):
         # Z-stack messages carry "z-step N/M"; highlight that exact Z-step line
         # (the generic rules below can't tell the Z steps apart).
         zstep = re.search(r'z-step (\d+)/(\d+)', msg)
+        # Repeat-condition messages (all conditions per point) carry
+        # "condition K/N"; highlight that condition's line.
+        cond = re.search(r'condition (\d+)/(\d+)', msg)
         if zstep:
             target = f"z-step {zstep.group(1)}/{zstep.group(2)}"
+            if cond:
+                target += f", condition {cond.group(1)}/{cond.group(2)}"
+        elif cond:
+            target = f"condition {cond.group(1)}/{cond.group(2)}"
         else:
             target = next((sub for key, sub in self._STEP_RULES if key in msg), None)
             if target is None:
@@ -862,9 +1167,42 @@ class ProtocolPanelWidget(QWidget):
             # end) live outside every block: fall back to a whole-text search.
             idx = next((i for i, ln in enumerate(lines)
                         if target in ln.lower()), -1)
-        if idx >= 0 and idx != self._highlight_idx:
+        if idx >= 0:
+            self._queue_highlight(idx)
+
+    # Minimum time (ms) each cursor step stays visible, and a cap so the cursor
+    # never lags far behind a long burst of fast steps (it collapses instead).
+    _HIGHLIGHT_DWELL_MS = 130
+    _HIGHLIGHT_QUEUE_CAP = 8
+
+    def _queue_highlight(self, idx: int):
+        """Queue a cursor move so each step is shown for at least a short dwell
+        (fast back-to-back steps would otherwise be painted over before seen)."""
+        last = self._highlight_queue[-1] if self._highlight_queue else self._highlight_idx
+        if idx == last:
+            return
+        self._highlight_queue.append(idx)
+        if len(self._highlight_queue) > self._HIGHLIGHT_QUEUE_CAP:
+            self._highlight_queue = self._highlight_queue[-self._HIGHLIGHT_QUEUE_CAP:]
+        if not self._highlight_timer.isActive():
+            self._advance_highlight()
+
+    def _advance_highlight(self):
+        """Apply the next queued cursor move, then dwell before the following
+        one (so even instant steps remain on screen briefly)."""
+        if not self._highlight_queue:
+            return
+        idx = self._highlight_queue.pop(0)
+        if idx != self._highlight_idx:
             self._highlight_idx = idx
             self._render_preview()
+        # Always wait the dwell before the next step can show.
+        self._highlight_timer.start(self._HIGHLIGHT_DWELL_MS)
+
+    def _clear_highlight_queue(self):
+        """Drop any pending cursor moves and stop the dwell timer."""
+        self._highlight_queue.clear()
+        self._highlight_timer.stop()
 
     def _create_control_panel(self) -> QWidget:
         """Create the control and parameters panel (scrollable)."""
@@ -894,9 +1232,22 @@ class ProtocolPanelWidget(QWidget):
         # Spectrum Acquisition (exposure / power / repetitions per point) sits
         # below the sample pattern.
         layout.addWidget(self._create_spectrum_acq_group())
+        # Per-repeat spectrum settings (repeats 2..N), shown below the main
+        # Spectrum Acquisition section (= repeat 1) when enabled in Acquisition
+        # Repeats. Filled by _rebuild_repeat_conditions().
+        self._repeat_cond_container = QWidget()
+        self._repeat_cond_layout = QVBoxLayout(self._repeat_cond_container)
+        self._repeat_cond_layout.setContentsMargins(0, 0, 0, 0)
+        self._repeat_cond_layout.setSpacing(10)
+        self._repeat_cond_rows: List[dict] = []
+        layout.addWidget(self._repeat_cond_container)
+        self._repeat_cond_container.setVisible(False)
 
-        # Acquisition repeats (whole-run repeat) — at the end.
+        # Acquisition repeats (whole-run repeat).
         layout.addWidget(self._create_repeats_group())
+
+        # What goes into each spectrum's metadata sidecar — at the very end.
+        layout.addWidget(self._create_metadata_group())
 
         # Control / Progress / Data Save live in the right column now.
         layout.addStretch()
@@ -986,14 +1337,26 @@ class ProtocolPanelWidget(QWidget):
         self._filename_edit.setStyleSheet(f'color: {COLORS["text_secondary"]};')
         self._filename_edit.setToolTip(
             "Spectra are named automatically; this shows the format for the "
-            "current mode + sampling pattern. Each field is name_value.\n"
-            "• a Custom prefix above is prepended to the name\n"
-            "• Current FoV starts at pattern_ (no sample/droplet/position)\n"
-            "• Robotic Deposition adds the sample name + droplet_ (from the "
-            "config) and position_ (well)\n"
-            "• the point position adapts to the pattern: row_/col_ (grid), "
-            "ring_/ray_ (ring), point_ (line/random)\n"
-            "• a z-stack adds zstep_<n>")
+            "current mode + sampling pattern. Each field is name_value, which "
+            "is what makes the run loadable straight into the spectrum "
+            "viewer.\n"
+            "• files go to <save folder>/<YYYY_MM_DD_n>/spectra/ with matching "
+            "sidecars in .../metadata/ - point the viewer at the dated folder\n"
+            "• a Custom prefix above is added as prefix_<value>\n"
+            "• Current FoV starts at pattern_ (no patient/sample/position)\n"
+            "• Robotic Deposition adds patient_ (sample name) and sample_ "
+            "(droplet number) - the two fields the viewer groups droplets by - "
+            "plus position_ (well)\n"
+            "• the point position always starts with point_<n>, plus the "
+            "pattern's spatial detail (grid adds row_/col_, ring adds "
+            "ring_/ray_)\n"
+            "• spectra_<n> is how many spectra the file holds: every "
+            "repetition taken at a position goes into ONE file, stacked as "
+            "repeated blocks\n"
+            "• a z-stack adds zstep_<n> (one file per z-step)\n"
+            "• the trailing x<um>_y<um> is the point's offset from the FoV "
+            "centre, which the viewer uses to place it on the hyperspectral "
+            "map")
         name_layout.addWidget(self._filename_edit)
         data_layout.addLayout(name_layout)
         self._update_filename_format()
@@ -1071,6 +1434,7 @@ class ProtocolPanelWidget(QWidget):
     def _create_spectrum_acq_group(self) -> QGroupBox:
         """Spectrum acquisition exposure / laser power (NOT the autofocus ones)."""
         group = QGroupBox("Spectrum Acquisition")
+        self._spec_acq_group = group  # retitled "... - Repeat 1" per repeat
         grid = QGridLayout(group)
         grid.setSpacing(8)
         r = 0
@@ -1133,7 +1497,8 @@ class ProtocolPanelWidget(QWidget):
                          lambda: self._live_spin(sv, '_af_nano_steps'))
         # Shared spectrometer settings for the autofocus scans.
         for key, label, attr in [
-            ('spec_af_exposure', "AF Exposure:", '_af_expo'),
+            ('spec_af_prusa_exposure', "Prusa AF Exposure:", '_af_prusa_expo'),
+            ('spec_af_nano_exposure', "NanoDrive AF Exposure:", '_af_nano_expo'),
             ('spec_af_power', "AF Laser Power:", '_af_power'),
             ('spec_af_reps', "AF Reps:", '_af_reps'),
         ]:
@@ -1296,37 +1661,55 @@ class ProtocolPanelWidget(QWidget):
         lay = QVBoxLayout(group)
         lay.setSpacing(6)
 
-        # Short labels keep the left column narrow; full descriptions are in
-        # the tooltips.
-        self._af_widefield_prusa = QCheckBox("Widefield AF (Prusa)")
-        self._af_widefield_prusa.setToolTip(
-            "Autofocus the widefield camera with the Prusa stage (once)")
-        self._af_widefield_prusa.setChecked(True)
-        self._af_wasatch_prusa = QCheckBox("Spectrometer Autofocus per point (Prusa)")
-        self._af_wasatch_prusa.setToolTip(
-            "Autofocus the Wasatch signal with the Prusa stage at each point")
-        self._af_wasatch_prusa.setChecked(True)
-        self._af_wasatch_nanodrive = QCheckBox("Spectrometer AF (NanoDrive)")
-        self._af_wasatch_nanodrive.setToolTip(
-            "Autofocus the Wasatch signal with the NanoDrive at each point")
-        self._af_wasatch_nanodrive.setChecked(True)
-        lay.addWidget(self._af_widefield_prusa)
-        lay.addWidget(self._af_wasatch_prusa)
-        lay.addWidget(self._af_wasatch_nanodrive)
-        for cb in (self._af_widefield_prusa, self._af_wasatch_prusa):
-            cb.toggled.connect(self._refresh_preview)
+        # Long labels: use wrapping checkboxes so the text flows onto a second
+        # row instead of overflowing the narrow left column. Full descriptions
+        # are in the tooltips.
+        widefield_row, self._af_widefield_prusa = self._wrapping_checkbox(
+            "Widefield Camera autofocus with Prusa",
+            "Autofocus the widefield camera with the Prusa stage (once)",
+            checked=True)
+        prusa_row, self._af_wasatch_prusa = self._wrapping_checkbox(
+            "Spectrometer coarse autofocus with Prusa for every point",
+            "Autofocus the spectrometer signal with the Prusa stage at each point",
+            checked=True)
+        # Per-sample variant: autofocus the spectrometer with the Prusa stage
+        # ONCE per sample (at the sample's first point), then reuse that focus Z
+        # for the rest of its points. Mutually exclusive with the per-point
+        # variant above.
+        prusa_sample_row, self._af_wasatch_prusa_sample = self._wrapping_checkbox(
+            "Spectrometer coarse autofocus with Prusa only for the first point "
+            "of every sample",
+            "Autofocus the spectrometer signal with the Prusa stage ONCE per "
+            "sample, at that sample's first point, then reuse that focus Z for "
+            "the rest of its points. In Robotic Deposition each droplet is a "
+            "sample (and it re-focuses on each protocol repeat). Mutually "
+            "exclusive with per-point Prusa autofocus.")
+        nanodrive_row, self._af_wasatch_nanodrive = self._wrapping_checkbox(
+            "Spectrometer fine auto focus with Nanodrive",
+            "Autofocus the spectrometer signal with the NanoDrive at each point",
+            checked=True)
+        lay.addWidget(widefield_row)
+        lay.addWidget(prusa_row)
+        lay.addWidget(prusa_sample_row)
+        lay.addWidget(nanodrive_row)
+        self._af_widefield_prusa.toggled.connect(self._refresh_preview)
+        # Per-point and per-sample Prusa AF are mutually exclusive (each unchecks
+        # the other), handled in their slots.
+        self._af_wasatch_prusa.toggled.connect(self._on_wasatch_prusa_toggled)
+        self._af_wasatch_prusa_sample.toggled.connect(
+            self._on_wasatch_prusa_sample_toggled)
         # NanoDrive AF is mutually exclusive with Z-stack (both drive the
         # NanoDrive Z), handled in its own slot.
         self._af_wasatch_nanodrive.toggled.connect(self._on_wasatch_nano_toggled)
 
         # Z-stack and NanoDrive AF are mutually exclusive (both drive the
         # NanoDrive Z). Checking one unchecks the other — switchable from either.
-        self._z_stack_check = QCheckBox("Z-stack at each point (NanoDrive)")
-        self._z_stack_check.setToolTip(
+        z_stack_row, self._z_stack_check = self._wrapping_checkbox(
+            "Z-stack for each point with Nanodrive",
             "Acquire a NanoDrive Z-stack at each point (uses the NanoDrive "
-            "range / step). Mutually exclusive with Wasatch AF (NanoDrive).")
+            "range / step). Mutually exclusive with Spectrometer AF (NanoDrive).")
         self._z_stack_check.toggled.connect(self._on_z_stack_toggled)
-        lay.addWidget(self._z_stack_check)
+        lay.addWidget(z_stack_row)
 
         # Optional photobleaching (laser on, no spectra saved) before measuring
         # at each point.
@@ -1344,6 +1727,35 @@ class ProtocolPanelWidget(QWidget):
         wait_row.addLayout(self._entry_with_unit(self._wait_time_spin, "s"))
         lay.addLayout(wait_row)
 
+        # --- Robotic Deposition-only options (hidden in Current FoV) ---------
+        # Center the droplet in the FoV before generating points, so the pattern
+        # is well centred. Re-captures after recentering; only the final images
+        # are saved.
+        self._center_sample_check = QCheckBox(
+            "Center sample before generating points")
+        self._center_sample_check.setChecked(True)
+        self._center_sample_check.setToolTip(
+            "Robotic Deposition only. After segmenting each droplet, recenter "
+            "the stage on the droplet's centroid and re-capture before "
+            "generating the pattern, so the points are centered in the field "
+            "of view. Only the final centered captured + segmented images are "
+            "saved.")
+        self._center_sample_check.toggled.connect(self._refresh_preview)
+        lay.addWidget(self._center_sample_check)
+
+        # Capture/segment/generate every droplet up front (widefield), then do
+        # all the measurements in the objective view without switching back.
+        self._upfront_check = QCheckBox("Capture all samples upfront")
+        self._upfront_check.setChecked(True)
+        self._upfront_check.setToolTip(
+            "Robotic Deposition only. Capture, segment, and generate points for "
+            "ALL selected droplets first (widefield, LED on), then turn the LED "
+            "off, switch to the objective once, and measure every droplet, "
+            "avoiding repeated widefield/objective switching during the "
+            "measurements.")
+        self._upfront_check.toggled.connect(self._refresh_preview)
+        lay.addWidget(self._upfront_check)
+
         # Reflect initial states
         self._on_z_stack_toggled()
         self._on_wait_toggled()
@@ -1359,6 +1771,9 @@ class ProtocolPanelWidget(QWidget):
                               stage-moved safety warning is deferred to Start
                               (see _confirm_stage_move_for_start).
         """
+        # The mode is frozen during a run; ignore any stray toggle.
+        if getattr(self, '_cfov_running', False):
+            return
         current_fov = self._mode_current_fov.isChecked()
         robotic = self._mode_robotic.isChecked()
 
@@ -1369,6 +1784,11 @@ class ProtocolPanelWidget(QWidget):
         # Sample Pattern panel: design controls vs. point count.
         self._pattern_params_widget.setVisible(not current_fov)
         self._pattern_count_label.setVisible(current_fov)
+
+        # Center / Upfront options only apply to Robotic Deposition.
+        if hasattr(self, '_center_sample_check'):
+            self._center_sample_check.setVisible(robotic)
+            self._upfront_check.setVisible(robotic)
 
         if current_fov:
             self._refresh_fov_view()
@@ -1415,6 +1835,11 @@ class ProtocolPanelWidget(QWidget):
     def _update_current_fov_availability(self):
         """Enable Current FoV only once points exist; if it becomes
         unavailable while selected, fall back to Robotic Deposition."""
+        # NEVER change the mode controls mid-run: a Robotic run feeds the live
+        # view per-droplet images/points (making Current FoV look "ready"), which
+        # would otherwise re-enable the mode radio that the run locked.
+        if getattr(self, '_cfov_running', False):
+            return
         ready = self._current_fov_ready()
         self._mode_current_fov.setEnabled(ready)
         if ready:
@@ -1589,6 +2014,27 @@ class ProtocolPanelWidget(QWidget):
             self._af_wasatch_nanodrive.blockSignals(False)
         self._refresh_preview()
 
+    def _on_wasatch_prusa_toggled(self):
+        """Per-point and per-sample Prusa spectrometer AF are mutually exclusive
+        (only one Prusa focusing scheme at a time). Checking per-point unchecks
+        per-sample (which stays clickable to switch back)."""
+        if (self._af_wasatch_prusa.isChecked()
+                and self._af_wasatch_prusa_sample.isChecked()):
+            self._af_wasatch_prusa_sample.blockSignals(True)
+            self._af_wasatch_prusa_sample.setChecked(False)
+            self._af_wasatch_prusa_sample.blockSignals(False)
+        self._refresh_preview()
+
+    def _on_wasatch_prusa_sample_toggled(self):
+        """Mirror of _on_wasatch_prusa_toggled: checking per-sample Prusa AF
+        unchecks the (mutually exclusive) per-point Prusa AF."""
+        if (self._af_wasatch_prusa_sample.isChecked()
+                and self._af_wasatch_prusa.isChecked()):
+            self._af_wasatch_prusa.blockSignals(True)
+            self._af_wasatch_prusa.setChecked(False)
+            self._af_wasatch_prusa.blockSignals(False)
+        self._refresh_preview()
+
     def _on_wasatch_nano_toggled(self):
         """Selecting Wasatch NanoDrive AF turns off the (mutually exclusive)
         Z-stack, so the user can switch back to NanoDrive AF by clicking it."""
@@ -1636,8 +2082,123 @@ class ProtocolPanelWidget(QWidget):
             "all points: point 1, point 2, …, then point 1, point 2, … again "
             "(NOT point 1, point 1, …). For back-to-back repeats at a single "
             "point, use 'Repetitions per point' instead.")
-        self._repeat_sample_spin.valueChanged.connect(self._refresh_preview)
+        self._repeat_sample_spin.valueChanged.connect(self._on_repeats_changed)
         grid.addLayout(self._entry_with_unit(self._repeat_sample_spin, ""), 0, 1)
+
+        row, self._repeat_cond_check = self._wrapping_checkbox(
+            "Use different spectrum acquisition settings for each repeat",
+            tooltip=("Adds a Spectrum Acquisition section per repeat (exposure, "
+                     "laser power, repetitions per point). Repeat 1 uses the "
+                     "main Spectrum Acquisition section."))
+        self._repeat_cond_check.toggled.connect(self._on_repeats_changed)
+        grid.addWidget(row, 1, 0, 1, 2)
+
+        row, self._repeat_all_check = self._wrapping_checkbox(
+            "Complete all repeat conditions before moving to the next point",
+            tooltip=("At each point: autofocus and photobleach ONCE, then "
+                     "acquire every repeat condition in turn before moving to "
+                     "the next point (instead of repeating the whole protocol "
+                     "once per condition)."))
+        self._repeat_all_check.toggled.connect(self._on_repeats_changed)
+        grid.addWidget(row, 2, 0, 1, 2)
+        self._update_repeat_options()
+        return group
+
+    def _on_repeats_changed(self, _=None):
+        self._update_repeat_options()
+        self._rebuild_repeat_conditions()
+        self._refresh_preview()
+
+    def _update_repeat_options(self):
+        """The per-repeat options only apply with more than one repeat."""
+        multi = self._repeat_sample_spin.value() > 1
+        for cb in (self._repeat_cond_check, self._repeat_all_check):
+            cb.setEnabled(multi)
+            cb.parentWidget().setEnabled(multi)
+
+    def _repeat_conditions_on(self) -> bool:
+        return (self._repeat_sample_spin.value() > 1
+                and self._repeat_cond_check.isChecked())
+
+    def _rebuild_repeat_conditions(self):
+        """Show one Spectrum Acquisition section per extra repeat (2..N) when
+        per-repeat settings are on. Existing sections keep their values; new
+        ones start from the main (repeat 1) settings."""
+        if not hasattr(self, '_repeat_cond_layout'):
+            return
+        on = self._repeat_conditions_on()
+        n_extra = self._repeat_sample_spin.value() - 1 if on else 0
+        if hasattr(self, '_spec_acq_group'):
+            self._spec_acq_group.setTitle(
+                "Spectrum Acquisition - Repeat 1" if on
+                else "Spectrum Acquisition")
+        while len(self._repeat_cond_rows) > n_extra:
+            g = self._repeat_cond_rows.pop()['group']
+            self._repeat_cond_layout.removeWidget(g)
+            g.setParent(None)
+            g.deleteLater()
+        while len(self._repeat_cond_rows) < n_extra:
+            self._repeat_cond_rows.append(
+                self._make_repeat_condition(len(self._repeat_cond_rows) + 2))
+        self._repeat_cond_container.setVisible(n_extra > 0)
+
+    def _make_repeat_condition(self, number: int) -> dict:
+        """One 'Spectrum Acquisition - Repeat N' section: exposure, laser power
+        and repetitions per point, ranges matching the main section."""
+        group = QGroupBox(f"Spectrum Acquisition - Repeat {number}")
+        grid = QGridLayout(group)
+        grid.setSpacing(8)
+        spins = {}
+        for r, (key, label) in enumerate([('acq_exposure', "Exposure Time:"),
+                                          ('acq_power', "Laser Power:")]):
+            base = self._bindings.get(key, (None,))[0]
+            if isinstance(base, QDoubleSpinBox):
+                spin = QDoubleSpinBox()
+                spin.setDecimals(base.decimals())
+            else:
+                spin = QSpinBox()
+            if base is not None:
+                spin.setRange(base.minimum(), base.maximum())
+                spin.setSingleStep(base.singleStep())
+                spin.setValue(base.value())
+            else:
+                spin.setRange(1, 10_000_000)
+                spin.setValue(100 if key == 'acq_exposure' else 50)
+            spin.valueChanged.connect(self._refresh_preview)
+            grid.addWidget(QLabel(label), r, 0)
+            grid.addLayout(self._entry_with_unit(spin, self._UNITS.get(key, '')),
+                           r, 1)
+            spins[key] = spin
+        grid.addWidget(QLabel("Repetitions per point:"), 2, 0)
+        reps = QSpinBox()
+        reps.setRange(1, 1000)
+        reps.setValue(self._reps_per_point_spin.value())
+        reps.valueChanged.connect(self._refresh_preview)
+        grid.addLayout(self._entry_with_unit(reps, ""), 2, 1)
+        self._repeat_cond_layout.addWidget(group)
+        return {'group': group, 'exposure': spins['acq_exposure'],
+                'power': spins['acq_power'], 'reps': reps}
+
+    def _create_metadata_group(self) -> QGroupBox:
+        """Metadata options: what extra detail each spectrum's sidecar carries.
+
+        The best-focus Z of every autofocus scan is always written. This adds
+        the FULL scan curves (Z vs focus score) as two tables appended to the
+        end of the metadata file, one for the Prusa scan and one for the
+        NanoDrive scan.
+        """
+        group = QGroupBox("Metadata")
+        lay = QVBoxLayout(group)
+        lay.setSpacing(6)
+        curves_row, self._save_af_curves_check = self._wrapping_checkbox(
+            "Save autofocus curves",
+            "Append the full Prusa and NanoDrive autofocus curves to each "
+            "spectrum's metadata file, as two blocks of Z position vs focus "
+            "score, followed by every raw spectrum collected during those "
+            "scans (one column per exposure, labelled with its Z and "
+            "repetition). The best-focus Z of each scan is always saved "
+            "regardless.")
+        lay.addWidget(curves_row)
         return group
 
     def _connect_signals(self):
@@ -1732,7 +2293,7 @@ class ProtocolPanelWidget(QWidget):
                 self._log("No sample points generated", error=True)
                 return
             self._progress_bar.setValue(0)
-            self.acquisition_requested.emit(self.get_acquisition_parameters())
+            self.acquisition_requested.emit(self._run_parameters())
             return
 
         # Robotic Deposition: hand off to the host window's worker, which moves
@@ -1742,9 +2303,18 @@ class ProtocolPanelWidget(QWidget):
             self._log("No droplets selected", error=True)
             return
         self._progress_bar.setValue(0)
-        params = dict(self.get_acquisition_parameters())
+        params = self._run_parameters()
         params['droplets'] = list(positions)  # [(row, col), …]
         self.robotic_requested.emit(params)
+
+    def _run_parameters(self) -> dict:
+        """Parameters handed to the worker at Start, plus the step preview as
+        plain text (rebuilt first so it matches these exact settings); the
+        worker saves it as acquisition_steps.txt in the experiment folder."""
+        params = dict(self.get_acquisition_parameters())
+        self._refresh_preview()
+        params['steps_preview'] = getattr(self, '_preview_plain', '') or ''
+        return params
 
     def _on_pause_clicked(self):
         """Handle pause button click."""
@@ -1782,6 +2352,10 @@ class ProtocolPanelWidget(QWidget):
     # --- host-driven Current-FoV run callbacks ------------------------------
     def on_acquisition_started(self):
         """The host window started the Current-FoV worker."""
+        # Build the final step list ONCE for this run, then freeze it: from here
+        # _refresh_preview is a no-op so the cursor advances on a stable list and
+        # nothing can rebuild it into a different mode mid-run.
+        self._refresh_preview()
         self._cfov_running = True
         self._cfov_paused = False
         self._progress_bar.setValue(0)
@@ -1820,9 +2394,13 @@ class ProtocolPanelWidget(QWidget):
         """The host window's worker finished (or was stopped)."""
         self._cfov_running = False
         self._cfov_paused = False
-        # Clear the live step highlight.
+        # Clear the live step highlight (and any pending dwell-queued moves), then
+        # rebuild the preview now that the run is over and refreshes are allowed
+        # again (mode availability may have changed while frozen).
+        self._clear_highlight_queue()
         self._highlight_idx = -1
-        self._render_preview()
+        self._update_current_fov_availability()
+        self._refresh_preview()
         # Primary button reverts to Start (re-gated by prerequisites); Stop off.
         self._start_btn.setText("Start")
         self._stop_btn.setEnabled(False)
@@ -1874,15 +2452,34 @@ class ProtocolPanelWidget(QWidget):
                                  else 'Robotic Deposition'),
             'reps_per_point': self._reps_per_point_spin.value(),
             'repeat_each_sample': self._repeat_sample_spin.value(),
+            # Per-repeat spectrum settings for repeats 2..N (repeat 1 = the
+            # main Spectrum Acquisition settings); see repeat_conditions().
+            'repeat_conditions_enabled': self._repeat_conditions_on(),
+            'repeat_conditions': [
+                {'exposure_ms': float(c['exposure'].value()),
+                 'power_mw': float(c['power'].value()),
+                 'reps_per_point': int(c['reps'].value())}
+                for c in self._repeat_cond_rows],
+            'repeat_all_conditions_per_point': (
+                self._repeat_sample_spin.value() > 1
+                and self._repeat_all_check.isChecked()),
             'autofocus_widefield_prusa': self._af_widefield_prusa.isChecked(),
             'autofocus_wasatch_prusa': self._af_wasatch_prusa.isChecked(),
+            'autofocus_wasatch_prusa_per_sample':
+                self._af_wasatch_prusa_sample.isChecked(),
             'autofocus_wasatch_nanodrive': self._af_wasatch_nanodrive.isChecked(),
             'z_stack': self._z_stack_check.isChecked(),
+            # Robotic Deposition-only options (ignored in Current FoV).
+            'center_sample': self._center_sample_check.isChecked(),
+            'capture_upfront': self._upfront_check.isChecked(),
             'wait_before_measure': self._wait_check.isChecked(),
             'wait_time_s': self._wait_time_spin.value(),
             'save_path': self._save_path_edit.text(),
             'filename_prefix': self._prefix_edit.text().strip(),
             'sample_pattern': self.selected_pattern_type(),
+            # Append the full Prusa / NanoDrive autofocus curves to each
+            # spectrum's metadata file (best-focus Z is always written).
+            'save_autofocus_curves': self._save_af_curves_check.isChecked(),
         }
         # Mirrored Live-tab parameters
         for key in self._bindings:

@@ -842,6 +842,10 @@ class LiveViewWidget(QWidget):
     # Point add/delete edit mode changed: 'add' / 'delete' on enter, '' on exit.
     # Lets the Auto-Acquisition FoV preview mirror this tab's Confirm/Cancel UI.
     point_edit_mode_changed = pyqtSignal(str)
+    # Emitted whenever the captured-image composite is rebuilt, so the Auto-
+    # Acquisition FoV preview (which mirrors it) can refresh (e.g. when the
+    # current acquisition point changes colour).
+    capture_overlay_changed = pyqtSignal()
 
     def __init__(
         self,
@@ -878,6 +882,9 @@ class LiveViewWidget(QWidget):
         # _sample_points, kept so a clicked point can drive the stage.
         self._generated_positions: List[SamplePosition] = []
         self._selected_point_id: Optional[int] = None
+        # Point currently being measured during an acquisition (1-based), shown
+        # in green on the captured-image preview. None when no run is active.
+        self._active_point_id: Optional[int] = None
 
         # Point-editing mode ('add' / 'delete' / None) and the snapshot used
         # to revert on Cancel.
@@ -1101,6 +1108,35 @@ class LiveViewWidget(QWidget):
         # its object-plane pixel size.
         self._capture_preview.set_scale_bar(self._widefield_config.pixel_size_x_um)
         cap_lay.addWidget(self._capture_preview)
+
+        # Floating "Save" button in the captured image's top-right corner. Saves
+        # the captured image, plus the segmented mask + generated points overlay
+        # when present. Hidden until an image has been captured.
+        self._save_capture_btn = QPushButton("Save", self._capture_preview)
+        self._save_capture_btn.setObjectName('saveCaptureBtn')
+        self._save_capture_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_capture_btn.setToolTip(
+            "Save the captured image (and the segmented mask + points overlay "
+            "if present)")
+        self._save_capture_btn.setStyleSheet(f'''
+            QPushButton#saveCaptureBtn {{
+                background-color: rgba(20, 20, 20, 200);
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['accent_primary']};
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-weight: bold;
+            }}
+            QPushButton#saveCaptureBtn:hover {{
+                background-color: {COLORS['accent_primary']};
+                color: #101010;
+            }}
+        ''')
+        self._save_capture_btn.clicked.connect(self._on_save_capture_clicked)
+        self._save_capture_btn.hide()
+        # Keep it anchored to the image's top-right as the preview resizes.
+        self._capture_preview.installEventFilter(self)
+        self._reposition_capture_save_btn()
         # Hint that the captured image is clickable to drive the stage — only
         # shown once sample points exist (see _update_cap_hint).
         self._cap_hint = QLabel("Click on a point to move over")
@@ -1197,13 +1233,13 @@ class LiveViewWidget(QWidget):
         # Spinboxes for each pattern type's parameters.
         self._grid_rows = _make_spin(1, 200, 3)
         self._grid_cols = _make_spin(1, 200, 3)
-        self._grid_buffer = _make_spin(-1000, 1000, 30, " um")
-        self._ring_rays = _make_spin(3, 360, 8)
+        self._grid_buffer = _make_spin(-1000, 1000, 100, " um")
+        self._ring_rays = _make_spin(3, 360, 5)
         self._ring_rings = _make_spin(1, 100, 3)
         self._ring_interval = _make_spin(1, 2000, 100, " um")
-        self._ring_buffer = _make_spin(-1000, 1000, 30, " um")
+        self._ring_buffer = _make_spin(-1000, 1000, 100, " um")
         self._line_points = _make_spin(2, 500, 5)
-        self._line_buffer = _make_spin(-1000, 1000, 30, " um")
+        self._line_buffer = _make_spin(-1000, 1000, 100, " um")
         self._rand_points = _make_spin(1, 2000, 10)
 
         # Buffer = margin from the mask edge, in MICROMETERS (converted to
@@ -1469,10 +1505,26 @@ class LiveViewWidget(QWidget):
         self._image_overlay.move(x, margin)
         self._image_overlay.raise_()
 
+    def _reposition_capture_save_btn(self):
+        """Anchor the Save button to the captured image's top-right corner."""
+        if not hasattr(self, '_save_capture_btn'):
+            return
+        self._save_capture_btn.adjustSize()
+        margin = 8
+        x = max(margin, self._capture_preview.width()
+                - self._save_capture_btn.width() - margin)
+        self._save_capture_btn.move(x, margin)
+        self._save_capture_btn.raise_()
+
     def eventFilter(self, obj, event):
-        if (obj is self._display
-                and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
-            self._reposition_image_overlay()
+        # Guarded with getattr: these widgets install their event filter at
+        # different points during construction, so an event can arrive before
+        # the other widget exists.
+        if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+            if obj is getattr(self, '_display', None):
+                self._reposition_image_overlay()
+            elif obj is getattr(self, '_capture_preview', None):
+                self._reposition_capture_save_btn()
         return super().eventFilter(obj, event)
 
     def _update_placeholder_size(self):
@@ -1512,11 +1564,26 @@ class LiveViewWidget(QWidget):
         self._update_capture_btn()
 
     def _update_capture_btn(self):
-        """Capture grabs the WIDEFIELD frame, so it's only available when the
-        widefield camera is connected AND that view is shown."""
-        wide_on = bool(self._widefield_thread
-                       and self._widefield_thread.is_connected)
-        self._capture_btn.setEnabled(wide_on and self._current_camera == 'wide')
+        """Capture grabs the frame from the camera currently being displayed,
+        so it's available in either view as long as that camera is connected.
+
+        Only a WIDEFIELD capture feeds segmentation / pattern generation /
+        auto-center (those are widefield-only); an objective capture is a
+        snapshot you can inspect and save."""
+        thread = self._displayed_camera_thread()
+        self._capture_btn.setEnabled(bool(thread and thread.is_connected))
+        if self._current_camera == 'wide':
+            self._capture_btn.setToolTip(
+                "Capture the widefield frame for segmentation")
+        else:
+            self._capture_btn.setToolTip(
+                "Capture the objective frame (snapshot only - segmentation "
+                "and pattern generation need a widefield capture)")
+
+    def _displayed_camera_thread(self):
+        """The camera thread feeding the view currently on screen."""
+        return (self._widefield_thread if self._current_camera == 'wide'
+                else self._objective_thread)
 
     def _process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Apply CLAHE contrast and smoothing (display-only, does not modify source)."""
@@ -1571,6 +1638,8 @@ class LiveViewWidget(QWidget):
             self._status_label.setStyleSheet(f'color: {COLORS["success"]};')
         # Enable play button if not already enabled
         self._acq_btn.setEnabled(True)
+        # Capture works in the objective view too, so it unlocks on connect.
+        self._update_capture_btn()
 
     def _on_switch_cam_clicked(self):
         target = 'objective' if self._current_camera == 'wide' else 'wide'
@@ -2061,8 +2130,10 @@ class LiveViewWidget(QWidget):
                 label_font.setBold(True)
                 for idx, (px, py) in enumerate(self._sample_points):
                     sx, sy = px * scale_x, py * scale_y
-                    # (selection highlight is unused — clicking just moves)
-                    selected = (self._selected_point_id == idx + 1)
+                    # Green for the clicked point OR the point currently being
+                    # measured during an acquisition; orange otherwise.
+                    selected = (self._selected_point_id == idx + 1
+                                or self._active_point_id == idx + 1)
                     color = QColor('#2ecc71') if selected else QColor('#f39c12')
                     rr = r + 3 * ss if selected else r
                     pen = QPen(color)
@@ -2092,18 +2163,95 @@ class LiveViewWidget(QWidget):
         # full-res and gets scaled to fit by the ClickableLabel.
         self._capture_preview.setFixedHeight(int(round(available_w * h / w)))
         self._capture_preview.set_base_pixmap(pixmap)
+        # A capture now exists -> reveal the top-right Save button.
+        self._save_capture_btn.show()
+        self._reposition_capture_save_btn()
         self.update_probe_marker()
+        # Let the Auto-Acquisition FoV preview (which mirrors this composite)
+        # refresh, so e.g. the green current-acquisition point shows there too.
+        self.capture_overlay_changed.emit()
+
+    @staticmethod
+    def _save_array_as_png(image: np.ndarray, path: str) -> bool:
+        """Write a camera image (grayscale or RGB) to ``path`` as PNG via QImage
+        (Qt handles non-ASCII paths, unlike cv2.imwrite). Returns True on
+        success."""
+        img = np.ascontiguousarray(image)
+        if img.ndim == 2:
+            h, w = img.shape
+            qi = QImage(img.data, w, h, w, QImage.Format.Format_Grayscale8)
+        else:
+            h, w, c = img.shape
+            fmt = (QImage.Format.Format_RGBA8888 if c == 4
+                   else QImage.Format.Format_RGB888)
+            qi = QImage(img.data, w, h, w * c, fmt)
+        # Detach from the numpy buffer before it goes out of scope.
+        return bool(qi.copy().save(path, 'PNG'))
+
+    def _on_save_capture_clicked(self):
+        """Save the captured image to a user-chosen file. If a segmentation mask
+        and/or generated points exist, also save the composite overlay (mask +
+        numbered points, exactly as shown) alongside with a '_segmented' suffix."""
+        if self._captured_image is None:
+            return
+        import os
+        from datetime import datetime
+        from PyQt6.QtWidgets import QFileDialog
+
+        default_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Captured Image", default_name, "PNG Image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith('.png'):
+            path += '.png'
+
+        if not self._save_array_as_png(self._captured_image, path):
+            self._seg_status.setText("Failed to save captured image")
+            logger.error(f"Failed to save captured image to {path}")
+            return
+        saved = [path]
+
+        # Composite (image + mask overlay + numbered points) when present — the
+        # ClickableLabel's base pixmap already holds exactly what's displayed.
+        if self._current_mask is not None or self._sample_points:
+            base, ext = os.path.splitext(path)
+            seg_path = f"{base}_segmented{ext}"
+            pm = self._capture_preview.base_pixmap()
+            if pm is not None and pm.save(seg_path, 'PNG'):
+                saved.append(seg_path)
+            else:
+                logger.error(f"Failed to save segmented overlay to {seg_path}")
+
+        names = ", ".join(os.path.basename(p) for p in saved)
+        self._seg_status.setText(f"Saved {names}")
+        logger.info(f"Saved captured image(s): {saved}")
+
+    def set_active_point(self, point_id: Optional[int]):
+        """Highlight the point currently being measured (1-based) in green on
+        the captured-image preview, or clear it with None. Used during a run to
+        sync the preview with the acquisition step the worker is on."""
+        if point_id == self._active_point_id:
+            return
+        self._active_point_id = point_id
+        self._update_capture_preview()
 
     # ---- Capture ----
 
-    def _capture_current_frame(self) -> bool:
-        """Grab the latest widefield frame as the captured image.
+    def _capture_current_frame(self, camera: Optional[str] = None) -> bool:
+        """Grab the latest frame from ``camera`` as the captured image.
+
+        ``camera`` is 'wide' or 'objective'; it defaults to the view currently
+        on screen, so the Capture button works in either view. The auto-center
+        loop passes 'wide' explicitly because it depends on the widefield
+        image/pixel scale.
 
         Records the stage position at capture time and clears any previous
-        mask/points. Returns True on success. Shared by the Capture button
-        and the auto-center loop.
+        mask/points. Returns True on success.
         """
-        thread = self._widefield_thread
+        camera = camera or self._current_camera
+        thread = (self._widefield_thread if camera == 'wide'
+                  else self._objective_thread)
         if not thread:
             return False
         frame = thread.get_latest_frame()
@@ -2111,8 +2259,10 @@ class LiveViewWidget(QWidget):
             return False
 
         self._captured_image = self._process_frame(frame.copy())
-        self._captured_camera = 'wide'
+        self._captured_camera = camera
         self._capture_stage_position = self._position_provider()
+        # The preview scale bar follows the camera the frame came from.
+        self._capture_preview.set_scale_bar(self.widefield_um_per_px())
 
         self._current_mask = None
         self._sample_points = []
@@ -2130,21 +2280,29 @@ class LiveViewWidget(QWidget):
         return True
 
     def _on_capture(self):
-        """Capture current widefield frame for segmentation."""
-        if self._capture_current_frame():
-            self._run_seg_btn.setEnabled(True)
-            pos = self._capture_stage_position
-            img = self._captured_image
-            self._seg_status.setText(
-                f"Captured: {img.shape[1]}x{img.shape[0]} "
-                f"@ ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
-            )
-            logger.info(
-                f"Image captured for segmentation, stage pos: "
-                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
-            )
-        else:
+        """Capture the frame from the camera currently on screen.
+
+        A widefield capture is the input to segmentation. An objective capture
+        is a snapshot only, so Segment stays locked (it needs the widefield
+        pixel scale to map mask pixels to stage coordinates).
+        """
+        if not self._capture_current_frame():
             self._seg_status.setText("No camera image available")
+            return
+
+        is_wide = self._captured_camera == 'wide'
+        self._run_seg_btn.setEnabled(is_wide)
+        pos = self._capture_stage_position
+        img = self._captured_image
+        view = "Widefield" if is_wide else "Objective"
+        self._seg_status.setText(
+            f"Captured ({view}): {img.shape[1]}x{img.shape[0]} "
+            f"@ ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+        )
+        logger.info(
+            f"{view} image captured, stage pos: "
+            f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+        )
 
     # ---- Segmentation ----
 
@@ -2156,6 +2314,13 @@ class LiveViewWidget(QWidget):
         load — which takes several seconds — clearly isn't frozen.
         """
         if self._captured_image is None:
+            return
+        if self._captured_camera != 'wide':
+            # Points are generated in the widefield frame; segmenting an
+            # objective snapshot would map its pixels to the wrong stage coords.
+            self._seg_status.setText(
+                "Capture in Wide FOV to segment (the current capture is "
+                "from the objective)")
             return
         if self._seg_worker is not None and self._seg_worker.isRunning():
             return  # already running
@@ -2233,12 +2398,13 @@ class LiveViewWidget(QWidget):
         self._seg_worker = None
 
     def _update_center_enabled(self):
-        """Center needs a captured image and a referenced stage. It stays
-        available even when the probe has moved outside the captured area (the
-        user asked to be able to re-centre from anywhere); the tooltip warns it
-        moves the stage."""
+        """Center needs a WIDEFIELD captured image and a referenced stage. It
+        stays available even when the probe has moved outside the captured area
+        (the user asked to be able to re-centre from anywhere); the tooltip
+        warns it moves the stage."""
         self._center_btn.setEnabled(
             self._captured_image is not None
+            and self._captured_camera == 'wide'
             and self._stage_referenced
             and not self._centering_active
         )
@@ -2306,13 +2472,21 @@ class LiveViewWidget(QWidget):
             return
         self._center_awaiting_move = False
         self._center_watchdog.stop()
-        # Give the camera a moment to deliver a frame from the new position.
-        QTimer.singleShot(300, self._center_recapture_and_segment)
+        # Let the stage fully settle before re-capturing, or the new frame is a
+        # blurred mid-vibration one. Use the configured capture-stabilization
+        # time (same wait used before the segmentation capture) rather than a
+        # short fixed delay, applied on EVERY centering iteration.
+        settle_ms = int(max(0.0,
+                            self._widefield_config.af_capture_stabilization_time)
+                        * 1000)
+        QTimer.singleShot(settle_ms, self._center_recapture_and_segment)
 
     def _center_recapture_and_segment(self):
         if not self._centering_active:
             return
-        if not self._capture_current_frame():
+        # Always the widefield frame: centering maps mask pixels to stage mm
+        # through the widefield pixel scale, regardless of the displayed view.
+        if not self._capture_current_frame('wide'):
             self._finish_centering("no camera image")
             return
         # Re-segment; result handled in _on_seg_finished -> _evaluate_centering.
@@ -2340,7 +2514,8 @@ class LiveViewWidget(QWidget):
         self._center_watchdog.stop()
         # Center stays available with a captured image and a referenced stage.
         self._update_center_enabled()
-        self._run_seg_btn.setEnabled(self._captured_image is not None)
+        self._run_seg_btn.setEnabled(self._captured_image is not None
+                                     and self._captured_camera == 'wide')
         self._pattern_status.setText(f"Center: {reason}")
         logger.info(f"Auto-center finished: {reason}")
 
@@ -2584,11 +2759,15 @@ class LiveViewWidget(QWidget):
         self._update_cap_hint()  # hint reminds to reference the stage if needed
 
     def widefield_um_per_px(self) -> float:
-        """Object-plane micrometers per widefield pixel (0 if uncalibrated).
+        """Object-plane micrometers per pixel of the CAPTURED image (0 if
+        uncalibrated).
 
-        The captured image is always the widefield camera, so mirrors of it (the
-        Auto-Acquisition FoV preview) use this to draw a matching scale bar."""
-        return self._widefield_config.pixel_size_x_um or 0.0
+        Mirrors of the captured image (the Auto-Acquisition FoV preview) use
+        this to draw a matching scale bar. It follows the camera the capture
+        actually came from, since Capture works in the objective view too."""
+        cfg = (self._widefield_config if self._captured_camera == 'wide'
+               else self._objective_config)
+        return cfg.pixel_size_x_um or 0.0
 
     def show_external_capture(self, image, mask, positions, capture_xyz):
         """Display a captured + segmented droplet produced OUTSIDE the Live tab
@@ -2603,13 +2782,15 @@ class LiveViewWidget(QWidget):
         if image is None:
             return
         self._captured_image = self._process_frame(image)
-        self._captured_camera = 'wide'
+        self._captured_camera = 'wide'  # the robotic run always captures widefield
         self._capture_stage_position = tuple(capture_xyz)
+        self._capture_preview.set_scale_bar(self.widefield_um_per_px())
         self._current_mask = mask
         self._generated_positions = list(positions)
         self._sample_points = [(p.pixel_x, p.pixel_y)
                                for p in self._generated_positions]
         self._selected_point_id = None
+        self._active_point_id = None  # new droplet: no point measured yet
         self._capture_preview.reset_view()  # fresh droplet image, start un-zoomed
         self._update_capture_preview()
         if mask is not None:
@@ -2633,6 +2814,7 @@ class LiveViewWidget(QWidget):
         if self._edit_mode is not None:
             self._exit_edit_mode()
         self._captured_image = None
+        self._captured_camera = 'wide'
         self._current_mask = None
         self._sample_points = []
         self._generated_positions = []
@@ -2641,6 +2823,8 @@ class LiveViewWidget(QWidget):
         self._capture_preview.reset_view()
         self._capture_preview.set_base_pixmap(None)
         self._capture_preview.setText("No capture")
+        # No capture -> hide the Save button.
+        self._save_capture_btn.hide()
         # Buttons gate on capture/mask/points, so disable them again.
         self._run_seg_btn.setEnabled(False)
         self._gen_pattern_btn.setEnabled(False)

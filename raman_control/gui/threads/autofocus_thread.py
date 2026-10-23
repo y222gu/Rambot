@@ -12,7 +12,7 @@ thread, camera thread and spectrum thread all expose thread-safe accessors).
 """
 
 import time
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -42,6 +42,7 @@ class AutofocusWorker(QThread):
         settle_s: float = 0.1,
         label: str = "Autofocus",
         maximize: bool = True,
+        prepare_fn: Optional[Callable[[], None]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -51,6 +52,10 @@ class AutofocusWorker(QThread):
         self._settle_s = settle_s
         self._label = label
         self._maximize = maximize  # True: best = highest score; False: lowest
+        # Optional one-time setup run on THIS thread before the scan starts
+        # (e.g. parking the NanoDrive at its initial position), so the caller
+        # never has to do blocking hardware I/O on the GUI thread.
+        self._prepare_fn = prepare_fn
         self._abort = False
 
     def _is_better(self, score: float, best: float) -> bool:
@@ -64,6 +69,13 @@ class AutofocusWorker(QThread):
         if not positions:
             self.finished_focus.emit(False, 0.0)
             return
+
+        # Bring the system to a known starting state before scoring anything.
+        if self._prepare_fn is not None and not self._abort:
+            try:
+                self._prepare_fn()
+            except Exception as e:  # noqa: BLE001 - never abort the scan for this
+                logger.error(f"{self._label}: prepare step failed: {e}")
 
         best_z = positions[0]
         best_score = float('-inf') if self._maximize else float('inf')

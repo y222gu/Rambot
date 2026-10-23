@@ -47,9 +47,13 @@ CAL = CalibrationParams(
 )
 
 # Wide -> objective offset (realistic signs from hardware_config defaults).
+# ``use_offset_calibration_curve=False`` pins the Y offset to the fixed value
+# so these tests exercise the plain offset math. The X-dependent curve has its
+# own tests in test_offset_calibration.py.
 OBJ_OFFSET = dict(calib_wide_to_obj_x=-62.48,
                   calib_wide_to_obj_y=1.32,
-                  calib_wide_to_obj_z=-13.26)
+                  calib_wide_to_obj_z=-13.26,
+                  use_offset_calibration_curve=False)
 
 
 @pytest.fixture

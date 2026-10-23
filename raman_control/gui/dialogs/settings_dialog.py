@@ -21,6 +21,7 @@ from raman_control.config.hardware_config import (
     NanoDriveConfig, SpectrometerConfig, SampleDropConfig,
 )
 from raman_control.config.logging_config import get_logger
+from raman_control.config.offset_calibration import get_offset_calibration
 from raman_control.gui.styles import COLORS
 
 logger = get_logger('settings_dialog')
@@ -44,6 +45,13 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
     'calib_wide_to_obj_x': ("Wide-to-Obj offset X (mm)", "Calibration offset"),
     'calib_wide_to_obj_y': ("Wide-to-Obj offset Y (mm)", "Calibration offset"),
     'calib_wide_to_obj_z': ("Wide-to-Obj offset Z (mm)", "Calibration offset"),
+    'use_offset_calibration_curve': (
+        "Calibration curve",
+        "Checked: the Y offset is read from the linear fit of "
+        "config/offset_calibration.csv at the current widefield X "
+        "(the offset drifts along X).\n"
+        "Unchecked: the fixed Wide-to-Obj offset Y above is used everywhere.",
+    ),
     'movement_stabilization_time': ("Stabilization time (s)", "Wait after movement"),
     'keepalive_interval': ("Keep-alive interval (s)", ""),
     # Serial
@@ -82,6 +90,38 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
     'laser_power': ("Laser power (%)", ""),
     'laser_power_mw': ("Laser power (mW)", ""),
     'averaging': ("Averaging", "Number of spectra to average"),
+    'af_prusa_signal_min_nm': (
+        "Signal band min (nm)",
+        "Lower edge of the SIGNAL band (numerator) for the Prusa coarse "
+        "autofocus. Default 808 nm (quartz peak)."),
+    'af_prusa_signal_max_nm': (
+        "Signal band max (nm)",
+        "Upper edge of the SIGNAL band (numerator) for the Prusa coarse "
+        "autofocus. Default 815 nm (quartz peak)."),
+    'af_prusa_reference_min_nm': (
+        "Reference band min (nm)",
+        "Lower edge of the REFERENCE band (denominator) for the Prusa coarse "
+        "autofocus. Default 790 nm (reflected laser line)."),
+    'af_prusa_reference_max_nm': (
+        "Reference band max (nm)",
+        "Upper edge of the REFERENCE band (denominator) for the Prusa coarse "
+        "autofocus. Default 795 nm (reflected laser line)."),
+    'af_nano_signal_min_nm': (
+        "Signal band min (nm)",
+        "Lower edge of the SIGNAL band (numerator) for the NanoDrive fine "
+        "autofocus. Default 808 nm (quartz peak)."),
+    'af_nano_signal_max_nm': (
+        "Signal band max (nm)",
+        "Upper edge of the SIGNAL band (numerator) for the NanoDrive fine "
+        "autofocus. Default 815 nm (quartz peak)."),
+    'af_nano_reference_min_nm': (
+        "Reference band min (nm)",
+        "Lower edge of the REFERENCE band (denominator) for the NanoDrive fine "
+        "autofocus. Default 790 nm (reflected laser line)."),
+    'af_nano_reference_max_nm': (
+        "Reference band max (nm)",
+        "Upper edge of the REFERENCE band (denominator) for the NanoDrive fine "
+        "autofocus. Default 795 nm (reflected laser line)."),
     # Stage safety limits
     'x_min': ("X min limit (mm)", "Minimum stage X position"),
     'x_max': ("X max limit (mm)", "Maximum stage X position"),
@@ -98,6 +138,20 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
 _HIGH_PRECISION_FIELDS = {
     'pixel_size_x_um', 'pixel_size_y_um', 'stabilization_time',
     'command_delay', 'movement_stabilization_time', 'step_size',
+}
+
+# Fields that must NOT get the default +/-99999 spin-box range. The
+# spectrometer exposure has no software cap: long integrations are a valid way
+# to pull signal out of a weak sample, so only the driver/hardware limits it.
+_UNCAPPED_FIELDS = {'integration_time'}
+
+# Spectrometer autofocus focus-score bands. Pulled out of the generic
+# Spectrometer group so they can be shown together under their own heading.
+_AF_BAND_FIELDS = {
+    'af_prusa_signal_min_nm', 'af_prusa_signal_max_nm',
+    'af_prusa_reference_min_nm', 'af_prusa_reference_max_nm',
+    'af_nano_signal_min_nm', 'af_nano_signal_max_nm',
+    'af_nano_reference_min_nm', 'af_nano_reference_max_nm',
 }
 
 
@@ -216,8 +270,37 @@ class SettingsDialog(QDialog):
         calib_group = self._make_group("Calibration Offsets (Wide FOV -> Objective)")
         calib_form = QFormLayout()
         calib_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        for name in ('calib_wide_to_obj_x', 'calib_wide_to_obj_y', 'calib_wide_to_obj_z'):
-            self._add_field(calib_form, name, getattr(self._config.stage, name), f"stage.{name}")
+        calib_widgets = {}
+        for name in ('calib_wide_to_obj_x', 'calib_wide_to_obj_y', 'calib_wide_to_obj_z',
+                     'use_offset_calibration_curve'):
+            calib_widgets[name] = self._add_field(
+                calib_form, name, getattr(self._config.stage, name), f"stage.{name}")
+
+        # The Y offset box is only used when the calibration curve is OFF;
+        # with the curve on, Y is computed from the CSV fit at the current
+        # widefield X, so the manual entry is greyed out to make that obvious.
+        self._calib_y_spin = calib_widgets['calib_wide_to_obj_y']
+        self._calib_y_label = calib_form.labelForField(self._calib_y_spin)
+        self._calib_curve_check = calib_widgets['use_offset_calibration_curve']
+        self._calib_curve_check.toggled.connect(self._on_calib_curve_toggled)
+
+        # Status line under the checkbox: what the fitted curve looks like, so
+        # the user can tell at a glance whether the CSV was picked up.
+        calib = get_offset_calibration()
+        if calib.is_valid:
+            curve_text = f"Curve: {calib.describe()}"
+            curve_color = COLORS.get('text_secondary', '#a0a0a0')
+        else:
+            curve_text = f"Curve unavailable: {calib.error}"
+            curve_color = COLORS['warning']
+        curve_label = QLabel(curve_text)
+        curve_label.setWordWrap(True)
+        curve_label.setStyleSheet(f"color: {curve_color}; font-size: 11px;")
+        curve_label.setToolTip(f"Source: {calib.filepath}")
+        calib_form.addRow("", curve_label)
+
+        self._on_calib_curve_toggled(self._calib_curve_check.isChecked())
+
         calib_group.setLayout(calib_form)
         layout.addWidget(calib_group)
 
@@ -254,6 +337,27 @@ class SettingsDialog(QDialog):
 
         layout.addStretch()
         self._tabs.addTab(tab, "Stage")
+
+    def _on_calib_curve_toggled(self, checked: bool):
+        """Grey out the manual Y offset while the calibration curve is on.
+
+        With the curve enabled the Y offset is computed from the fit at the
+        current widefield X, so the typed value has no effect. The value is
+        still read back and kept in the config, so unchecking the box
+        restores whatever was last entered.
+        """
+        self._calib_y_spin.setEnabled(not checked)
+        if self._calib_y_label is not None:
+            self._calib_y_label.setEnabled(not checked)
+
+        if checked:
+            self._calib_y_spin.setToolTip(
+                "Ignored while 'Calibration curve' is checked - the Y offset "
+                "is computed from config/offset_calibration.csv at the current "
+                "widefield X. Uncheck to use this fixed value."
+            )
+        else:
+            self._calib_y_spin.setToolTip(_tooltip_for('calib_wide_to_obj_y'))
 
     def _build_cameras_tab(self):
         tab = self._make_scroll_tab()
@@ -297,9 +401,44 @@ class SettingsDialog(QDialog):
         group = self._make_group("Spectrometer (Wasatch Photonics)")
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self._add_dataclass_fields(form, self._config.spectrometer, "spectrometer")
+        self._add_dataclass_fields(form, self._config.spectrometer, "spectrometer",
+                                   exclude=_AF_BAND_FIELDS)
         group.setLayout(form)
         layout.addWidget(group)
+
+        # Focus-score bands get their own groups: they define the metric each
+        # spectrometer autofocus minimises, not an acquisition setting. The
+        # coarse (Prusa) and fine (NanoDrive) scans are tuned separately.
+        note = QLabel(
+            "Focus score = summed intensity of the signal band / summed "
+            "intensity of the reference band. Each scan keeps the Z with the "
+            "LOWEST score. Bands are inclusive, in nanometres. The two scans "
+            "have independent bands; set them the same to score alike. "
+            "Their exposure times live in the Live tab's Autofocus panel."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"color: {COLORS.get('text_secondary', '#a0a0a0')}; font-size: 11px;"
+            " padding: 2px 4px;")
+        layout.addWidget(note)
+
+        for title, names in (
+            ("Prusa Autofocus Score (coarse)",
+             ('af_prusa_signal_min_nm', 'af_prusa_signal_max_nm',
+              'af_prusa_reference_min_nm', 'af_prusa_reference_max_nm')),
+            ("NanoDrive Autofocus Score (fine)",
+             ('af_nano_signal_min_nm', 'af_nano_signal_max_nm',
+              'af_nano_reference_min_nm', 'af_nano_reference_max_nm')),
+        ):
+            af_group = self._make_group(title)
+            af_form = QFormLayout()
+            af_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            for name in names:
+                self._add_field(af_form, name,
+                                getattr(self._config.spectrometer, name),
+                                f"spectrometer.{name}")
+            af_group.setLayout(af_form)
+            layout.addWidget(af_group)
 
         layout.addStretch()
         self._tabs.addTab(tab, "Spectrometer")
@@ -343,7 +482,11 @@ class SettingsDialog(QDialog):
             self._add_field(form, f.name, val, f"{prefix}.{f.name}")
 
     def _add_field(self, form: QFormLayout, name: str, value: Any, dotted_key: str):
-        """Add a single field row to a form layout and register the widget."""
+        """Add a single field row to a form layout and register the widget.
+
+        Returns the created widget so callers can wire up extra behavior
+        (e.g. enabling/disabling one field from another).
+        """
         label_text = _label_for(name)
         tooltip = _tooltip_for(name)
         widget: QWidget
@@ -357,7 +500,10 @@ class SettingsDialog(QDialog):
             widget = QDoubleSpinBox()
             decimals = 3 if name in _HIGH_PRECISION_FIELDS else 2
             widget.setDecimals(decimals)
-            widget.setRange(-99999.0, 99999.0)
+            if name in _UNCAPPED_FIELDS:
+                widget.setRange(0.0, 1e12)
+            else:
+                widget.setRange(-99999.0, 99999.0)
             widget.setSingleStep(0.01 if decimals == 3 else 0.1)
             widget.setValue(value)
             if tooltip:
@@ -381,6 +527,7 @@ class SettingsDialog(QDialog):
         widget.setMinimumWidth(180)
         form.addRow(label_text, widget)
         self._widgets.append((dotted_key, widget))
+        return widget
 
     # ------------------------------------------------------------------
     # Read widget values
@@ -425,6 +572,10 @@ class SettingsDialog(QDialog):
                 widget.setValue(int(obj))
             elif isinstance(widget, QLineEdit) and not widget.isReadOnly():
                 widget.setText(str(obj))
+
+        # setChecked only emits toggled on an actual change, so re-sync the
+        # dependent enable state explicitly after repopulating.
+        self._on_calib_curve_toggled(self._calib_curve_check.isChecked())
 
     # ------------------------------------------------------------------
     # Button handlers

@@ -81,6 +81,15 @@ class SpectrumThread(QThread):
         # caller thread + the run loop's get_line() causes libusb timeouts).
         self._pending_settings: dict = {}
 
+        # Live-view pause count. While > 0 the free-running display loop takes
+        # no frames of its own; only on-demand acquire_frames() requests run.
+        # Autofocus / auto-acquisition hold it so the live loop doesn't slip an
+        # extra single frame between their requests (which cost an extra
+        # exposure of wait + laser time per step, and replaced the plotted
+        # autofocus spectrum with a noisier one). Counted so nested holders
+        # can't release each other's pause.
+        self._live_holds = 0
+
         # Wasatch SDK objects
         self._device = None
         self._fid = None  # FID = Feature Identification Device (hardware interface)
@@ -172,7 +181,9 @@ class SpectrumThread(QThread):
                         self._wavelengths, self._latest_spectrum, time.time())
                 continue
 
-            if self._acquiring:
+            with QMutexLocker(self._mutex):
+                live = self._acquiring and self._live_holds == 0
+            if live:
                 acq_start = time.time()
 
                 # Acquire a single spectrum for display (no averaging).
@@ -223,6 +234,24 @@ class SpectrumThread(QThread):
         with QMutexLocker(self._mutex):
             self._acquiring = False
         logger.info("Spectrum acquisition stopped")
+
+    def hold_live(self):
+        """Pause the free-running live-view frames (see ``_live_holds``).
+        On-demand acquire_frames() requests still run and are still plotted.
+        A live frame already in progress finishes first. Pair every call with
+        :meth:`release_live`."""
+        with QMutexLocker(self._mutex):
+            self._live_holds += 1
+            n = self._live_holds
+        logger.debug(f"Live spectrum paused (holds={n})")
+
+    def release_live(self):
+        """Undo one :meth:`hold_live`; live view resumes when none remain
+        (and only if live acquisition is switched on)."""
+        with QMutexLocker(self._mutex):
+            self._live_holds = max(0, self._live_holds - 1)
+            n = self._live_holds
+        logger.debug(f"Live spectrum hold released (holds={n})")
 
     def set_integration_time(self, time_ms: float):
         """Set integration time in milliseconds (applied on the spectrum
