@@ -39,6 +39,7 @@ from raman_control.gui.widgets.live_view import LiveViewWidget
 from raman_control.gui.widgets.spectrum_viewer import SpectrumViewerWidget
 from raman_control.gui.widgets.protocol_panel import ProtocolPanelWidget
 from raman_control.gui.widgets.sample_grid import SampleGridWidget
+from raman_control.gui.widgets.calibration_panel import CalibrationPanelWidget
 from raman_control.core.state_machine import AcquisitionStateMachine
 from raman_control.core.autofocus import AutofocusEngine
 from raman_control.core.coordinate_manager import CoordinateManager, CameraView
@@ -211,6 +212,10 @@ class MainWindow(QMainWindow):
         self._af_registered = False
         self._af_worker: Optional[AutofocusWorker] = None
 
+        # True while a Calibration-tab motion test runs (the UI is locked and
+        # acquisition / autofocus / manual moves are refused meanwhile).
+        self._calibration_running = False
+
         # Current-FoV acquisition worker (one run at a time).
         self._acq_worker: Optional[AcquisitionWorker] = None
         # Snapshot of widget enabled-states while the UI is locked mid-run.
@@ -361,6 +366,18 @@ class MainWindow(QMainWindow):
         )
         self._tab_widget.addTab(self._protocol_panel, "Auto Acquisition")
 
+        # === Tab 3: Calibration (unit 1 motion test) ========================
+        # Self-contained: its moves are atomic relative blocks on the shared
+        # motion queue and its images come from an opt-in raw-frame tap, so the
+        # Live / Auto Acquisition behaviour is unchanged.
+        self._calibration_panel = CalibrationPanelWidget(
+            motion_thread=self._motion_thread,
+            camera=self._widefield_camera,
+            stage_config=self._config.stage,
+            busy_reason=self._calibration_busy_reason,
+        )
+        self._tab_widget.addTab(self._calibration_panel, "Calibration")
+
     def _setup_statusbar(self):
         self._status_widget = StatusBarWidget()
         # No margins / size grip so the LED control sits flush in the far-left
@@ -496,6 +513,13 @@ class MainWindow(QMainWindow):
         self._protocol_panel.pause_requested.connect(self._on_acq_pause)
         self._protocol_panel.resume_requested.connect(self._on_acq_resume)
         self._protocol_panel.stop_requested.connect(self._on_acq_stop)
+
+        # Calibration tab: lock the rest of the UI while a test runs.
+        self._calibration_panel.running_changed.connect(
+            self._on_calibration_running)
+        self._calibration_panel.status_message.connect(
+            self._status_widget.show_message)
+        self._calibration_panel.progress.connect(self._status_widget.set_progress)
 
         # The illumination LED is independent of the measurement hardware: it
         # connects at launch and stays available (controls are always live and
@@ -821,7 +845,7 @@ class MainWindow(QMainWindow):
         acq_running = (self._acq_worker is not None
                        and self._acq_worker.isRunning())
         base = (self._af_registered and self._af_worker is None
-                and not acq_running)
+                and not acq_running and not self._calibration_running)
         objective = self._coordinate_manager.current_view == CameraView.OBJECTIVE
         self._live_view.set_autofocus_enabled(base)
         self._spectrum_viewer.set_autofocus_enabled(base and objective)
@@ -877,9 +901,10 @@ class MainWindow(QMainWindow):
             if on_finish is not None:
                 on_finish()
             return  # one scan at a time
-        if self._acq_worker is not None and self._acq_worker.isRunning():
+        if self._calibration_running or (
+                self._acq_worker is not None and self._acq_worker.isRunning()):
             self._status_widget.show_message(
-                "Autofocus unavailable during acquisition", 3000)
+                "Autofocus unavailable during acquisition / calibration", 3000)
             if on_finish is not None:
                 on_finish()
             return
@@ -1134,6 +1159,9 @@ class MainWindow(QMainWindow):
             self._status_widget.show_message(msg, 5000)
 
         logger.info("Current FoV start requested")
+        if self._calibration_running:
+            _bail("A calibration test is running")
+            return
         if self._acq_worker is not None and self._acq_worker.isRunning():
             _bail("Acquisition already running")
             return
@@ -1234,6 +1262,9 @@ class MainWindow(QMainWindow):
             self._status_widget.show_message(msg, 5000)
 
         logger.info("Robotic Deposition start requested")
+        if self._calibration_running:
+            _bail("A calibration test is running")
+            return
         if self._acq_worker is not None and self._acq_worker.isRunning():
             _bail("Acquisition already running")
             return
@@ -1398,7 +1429,25 @@ class MainWindow(QMainWindow):
         """True while a Current-FoV acquisition worker is active."""
         return self._acq_worker is not None and self._acq_worker.isRunning()
 
-    def _set_ui_locked(self, locked: bool):
+    def _calibration_busy_reason(self):
+        """Why a calibration test cannot start now (None if it can)."""
+        if self._acq_running():
+            return "an acquisition is running"
+        if self._af_worker is not None and self._af_worker.isRunning():
+            return "an autofocus scan is running"
+        return None
+
+    def _on_calibration_running(self, running: bool):
+        """Lock everything except the calibration Abort / E-stop / event log
+        while a test runs, so no other stage move can be issued."""
+        if running == self._calibration_running:
+            return
+        self._calibration_running = running
+        self._set_ui_locked(
+            running, keep=self._calibration_panel.controls_enabled_while_running())
+        self._update_af_buttons()
+
+    def _set_ui_locked(self, locked: bool, keep=()):
         """Lock the UI during an acquisition: every button / entry box / slider /
         combo is disabled EXCEPT Pause and Stop. Display widgets (camera views,
         spectrum & focus plots, the droplet map) are NOT disabled, so they keep
@@ -1419,6 +1468,7 @@ class MainWindow(QMainWindow):
                  getattr(pnl, '_stop_btn', None),
                  getattr(self._spectrum_viewer, '_laser_btn', None),
                  getattr(self._spectrum_viewer, '_autoscale_btn', None)}
+        owned |= set(keep)
 
         from PyQt6.QtCore import Qt
         if locked:
@@ -1584,8 +1634,8 @@ class MainWindow(QMainWindow):
         placed over the same sample point. Z is left at the current value
         (XY-only move, matching well selection).
         """
-        if self._acq_running():
-            msg = "Move-to-point is disabled during acquisition"
+        if self._acq_running() or self._calibration_running:
+            msg = "Move-to-point is disabled during acquisition / calibration"
             logger.info(msg)
             self._status_widget.show_message(msg, 3000)
             return
@@ -1618,8 +1668,8 @@ class MainWindow(QMainWindow):
         using ``logical_to_physical`` which accounts for the current
         camera view (wide FOV vs objective offset).
         """
-        if self._acq_running():
-            msg = "Well move is disabled during acquisition"
+        if self._acq_running() or self._calibration_running:
+            msg = "Well move is disabled during acquisition / calibration"
             logger.info(msg)
             self._status_widget.show_message(msg, 3000)
             return
@@ -1792,6 +1842,11 @@ class MainWindow(QMainWindow):
                     worker.wait(wait_ms)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Worker shutdown error: {e}")
+
+        try:
+            self._calibration_panel.shutdown()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Calibration shutdown error: {e}")
 
         # Stop each hardware thread independently so one hang/error can't
         # prevent the others (notably the LED) from closing cleanly.

@@ -338,6 +338,87 @@ class MotionThread(QThread):
             return False
         return result['ok']
 
+    # --- Calibration (motion test) helpers --------------------------------
+
+    def request_relative_block(self, lines: list, callback=None) -> bool:
+        """Queue an atomic relative-mode block (fire-and-forget; safe on the
+        GUI thread). See ``StepperStage.run_relative_block``."""
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                self.error.emit("Stage not connected")
+                return False
+            return self._stage.run_relative_block(lines, callback=callback)
+
+    def run_relative_block_blocking(self, lines: list,
+                                    timeout: float = 60.0) -> Tuple[bool, list]:
+        """Run an atomic relative-mode block and wait for it (incl. the
+        position refresh after it). Worker threads only, never the GUI
+        thread. Returns ``(success, results)``."""
+        done = threading.Event()
+        out = {'ok': False, 'results': []}
+
+        def _cb(success: bool, results: list):
+            out['ok'], out['results'] = bool(success), results
+            done.set()
+
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                return False, []
+            if not self._stage.run_relative_block(lines, callback=_cb):
+                return False, []
+
+        if not done.wait(timeout):
+            logger.warning(f"Relative block timed out: {lines}")
+            return False, out['results']
+        return out['ok'], out['results']
+
+    def query_position_blocking(self, timeout: float = 5.0):
+        """Fresh M114 position as (x, y, z), or None. Worker threads only.
+        The mutex is not held while waiting."""
+        done = threading.Event()
+        out = {'pos': None}
+
+        def _cb(pos):
+            out['pos'] = pos
+            done.set()
+
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                return None
+            self._stage.get_position(callback=_cb)
+
+        if not done.wait(timeout) or out['pos'] is None:
+            return None
+        p = out['pos']
+        return (p.x, p.y, p.z)
+
+    def read_firmware_settings_blocking(self, timeout: float = 15.0) -> Tuple[bool, str]:
+        """M503 output text. Worker threads only."""
+        done = threading.Event()
+        out = {'ok': False, 'text': ''}
+
+        def _cb(success: bool, text: str):
+            out['ok'], out['text'] = bool(success), text
+            done.set()
+
+        with QMutexLocker(self._mutex):
+            if not (self._stage and self._stage.is_connected):
+                return False, ''
+            if not self._stage.read_firmware_settings(_cb):
+                return False, ''
+
+        if not done.wait(timeout):
+            return False, out['text']
+        return out['ok'], out['text']
+
+    def emergency_stop_immediate(self) -> None:
+        """Send M112 out of band (bypasses the command queue). The printer
+        must be reset and re-homed afterwards."""
+        with QMutexLocker(self._mutex):
+            stage = self._stage
+        if stage:
+            stage.emergency_stop_immediate()
+
     def move_xyz_blocking(
         self,
         x: Optional[float] = None,

@@ -23,7 +23,7 @@ from PyQt6.QtCore import QPointF
 from raman_control.gui.styles import COLORS
 from raman_control.config.logging_config import get_logger
 from raman_control.core.slide_layout import (  # noqa: F401 (re-exported)
-    ROW_GROUPS, COL_GROUPS, slide_of_well)
+    ROW_GROUPS, COL_GROUPS, deposition_index, slide_of_well)
 
 logger = get_logger('sample_grid')
 
@@ -638,7 +638,7 @@ class SampleGridWidget(QWidget):
                 self._selected_positions.add(pos)
             self._restyle(pos)
         self._count_label.setText(f"{len(self._selected_positions)} selected")
-        self.selection_changed.emit(list(self._selected_positions))
+        self.selection_changed.emit(self.get_selected_positions())
 
     def _on_view_mouse_release(self, event: QMouseEvent):
         """Finish a drag-select, or handle a plain click. Ignored if disabled."""
@@ -673,7 +673,7 @@ class SampleGridWidget(QWidget):
                 self._selected_positions.add(pos)
             self._restyle(pos)
             self._count_label.setText(f"{len(self._selected_positions)} selected")
-            self.selection_changed.emit(list(self._selected_positions))
+            self.selection_changed.emit(self.get_selected_positions())
         else:
             old = self._current_position
             self._current_position = pos
@@ -689,7 +689,7 @@ class SampleGridWidget(QWidget):
         self._selected_positions = set(self._circles.keys())
         self._refresh_styles()
         self._count_label.setText(f"{len(self._selected_positions)} selected")
-        self.selection_changed.emit(list(self._selected_positions))
+        self.selection_changed.emit(self.get_selected_positions())
 
     def _on_clear_selection(self):
         if not self._interactive():
@@ -700,7 +700,11 @@ class SampleGridWidget(QWidget):
         self.selection_changed.emit([])
 
     def get_selected_positions(self) -> List[Tuple[int, int]]:
-        return list(self._selected_positions)
+        """Selected (row, col) wells in the Opentrons deposition order (slide
+        by slide, each slide row-serpentine), so a Robotic run always measures
+        droplets in the sequence they were deposited, never set/hash order."""
+        return sorted(self._selected_positions,
+                      key=lambda rc: deposition_index(rc[0], rc[1] + 1))
 
     def droplet_map(self) -> dict:
         """Loaded droplet config keyed by well name (e.g. 'B3' -> {sample_name,

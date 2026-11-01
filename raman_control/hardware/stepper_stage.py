@@ -475,17 +475,26 @@ class StepperStage(MotionDevice):
         self._protocol.send_command('M400', callback=_begin, timeout_ms=60000)
         return True
 
-    def get_position(self) -> Tuple[float, float, float]:
+    def get_position(
+        self,
+        callback: Optional[Callable[[Optional[StagePosition]], None]] = None,
+    ) -> Tuple[float, float, float]:
         """
         Query current position from printer (non-blocking).
 
         Queues an M114 command. When the response arrives, the cached
         position is updated and ``_on_position_changed`` is called.
 
+        Args:
+            callback: Optional; called with the parsed position (or None if
+                the query failed) once the response arrives.
+
         Returns:
             Current cached position (may not yet reflect the queued query).
         """
         if not self._protocol or not self._protocol.is_running:
+            if callback:
+                callback(None)
             return tuple(self._position)
 
         def on_response(success: bool, response: str):
@@ -494,6 +503,8 @@ class StepperStage(MotionDevice):
                     pos = self._parse_position_line(line)
                     if pos:
                         self._update_position(pos)
+                        if callback:
+                            callback(pos)
                         return
                 # ACK received but no position data — log for debugging
                 self.logger.warning(
@@ -502,9 +513,131 @@ class StepperStage(MotionDevice):
                 )
             else:
                 self.logger.debug(f"M114 failed: {response!r}")
+            if callback:
+                callback(None)
 
         self._protocol.send_command('M114', callback=on_response, timeout_ms=3000)
         return tuple(self._position)
+
+    # Commands allowed inside a relative block. Anything that changes modes
+    # or homes (G90/G91/G28/M211/...) is refused so a block can only move by
+    # the given deltas and wait.
+    _RELATIVE_BLOCK_ALLOWED = ('G0', 'G1', 'G4', 'M400', 'M114')
+
+    @staticmethod
+    def parse_move_deltas(line: str) -> Tuple[float, float, float]:
+        """(dx, dy, dz) in mm carried by a G0/G1 line; zeros otherwise."""
+        parts = line.split(';', 1)[0].split()
+        if not parts or parts[0].upper() not in ('G0', 'G1'):
+            return (0.0, 0.0, 0.0)
+        d = {'X': 0.0, 'Y': 0.0, 'Z': 0.0}
+        for p in parts[1:]:
+            axis = p[:1].upper()
+            if axis in d:
+                d[axis] = float(p[1:])
+        return (d['X'], d['Y'], d['Z'])
+
+    def run_relative_block(
+        self,
+        lines: list,
+        callback: Optional[Callable[[bool, list], None]] = None,
+        timeout_ms: int = 15000,
+    ) -> bool:
+        """Run G-code lines in RELATIVE mode as one uninterruptible block.
+
+        Sent as ``G91, <lines...>`` with ``G90`` always sent afterwards, all
+        as a single queue item, so no other command (jog, keepalive, Live-tab
+        move) can run while the firmware is in relative mode, and the printer
+        is back in absolute mode as soon as the block ends. Moves are never
+        auto-retried (a repeated relative move would double the motion) and
+        the block stops at the first line that is not ACKed.
+
+        The commanded deltas of the ACKed moves are added to the relative-move
+        base used by ``move_by`` so Live-tab jogs keep accumulating from the
+        true position. If the block failed part-way, that base is re-anchored
+        from a fresh M114 instead.
+
+        Used by the calibration (motion test) tab. Normal stage moves do not
+        use this path.
+
+        Args:
+            lines: e.g. ``['G1 X0.010 F60', 'M400', 'G4 S2']``
+            callback: Called with ``(success, results)``; ``results`` is a
+                list of ``(line, acked, response)``.
+            timeout_ms: Per-line ACK timeout (covers M400/G4 waits).
+
+        Returns:
+            True if the block was queued.
+        """
+        if not self._protocol or not self._protocol.is_running:
+            self.logger.error("Protocol not running")
+            return False
+        if not self.all_referenced:
+            self.logger.error("Relative block refused: stage not referenced")
+            return False
+        for line in lines:
+            head = line.split(';', 1)[0].split()
+            if not head or head[0].upper() not in self._RELATIVE_BLOCK_ALLOWED:
+                self.logger.error(f"Relative block refused: '{line}' not allowed")
+                return False
+
+        def on_done(success: bool, results: list):
+            dx = dy = dz = 0.0
+            for line, acked, _resp in results:
+                if acked:
+                    ddx, ddy, ddz = self.parse_move_deltas(line)
+                    dx, dy, dz = dx + ddx, dy + ddy, dz + ddz
+            if success:
+                with self._position_lock:
+                    self._target_position.x += dx
+                    self._target_position.y += dy
+                    self._target_position.z += dz
+
+                def _after_m114(_pos):
+                    if callback:
+                        callback(success, results)
+                self.get_position(callback=_after_m114)
+            else:
+                # A move whose ACK was lost may or may not have run, so the
+                # commanded base is unknown: re-anchor it from the printer.
+                def _resync(pos):
+                    if pos is not None:
+                        self._set_commanded_target(pos.x, pos.y, pos.z)
+                    if callback:
+                        callback(success, results)
+                self.get_position(callback=_resync)
+
+        self._protocol.send_sequence(
+            ['G91'] + list(lines),
+            finally_commands=['G90'],
+            callback=on_done,
+            timeout_ms=timeout_ms,
+        )
+        return True
+
+    def read_firmware_settings(
+        self, callback: Callable[[bool, str], None]
+    ) -> bool:
+        """Queue M503 (report settings); callback gets (success, text)."""
+        if not self._protocol or not self._protocol.is_running:
+            return False
+        self._protocol.send_command('M503', callback=callback,
+                                    timeout_ms=5000, retries=1)
+        return True
+
+    def emergency_stop_immediate(self) -> None:
+        """M112 written straight to the port, bypassing the command queue.
+
+        On Prusa/Marlin this kills the printer: it must be reset or
+        power-cycled and re-homed afterwards. All axes are marked
+        unreferenced so no further absolute moves are sent.
+        """
+        if self._protocol:
+            self._protocol.clear_queue()
+            self._protocol.send_immediate('M112')
+        self._referenced = {'X': False, 'Y': False, 'Z': False}
+        self._stop_keepalive()
+        self.logger.critical("EMERGENCY STOP (M112) sent")
 
     def get_position_sync(self) -> Tuple[float, float, float]:
         """

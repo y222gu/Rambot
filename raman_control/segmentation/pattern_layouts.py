@@ -151,18 +151,16 @@ def generate_ring(mask, params: Dict) -> Tuple[Points, Orders]:
     ring_numbers = np.array(ring_numbers)
     line_numbers = np.array(line_numbers)
 
-    point_angles = np.arctan2(all_y - center_y, all_x - center_x)
-    sorted_idx = np.argsort(point_angles)
-    all_x = all_x[sorted_idx]
-    all_y = all_y[sorted_idx]
-    ring_numbers = ring_numbers[sorted_idx]
-    line_numbers = line_numbers[sorted_idx]
-
-    min_y_index = int(np.argmin(all_y))
-    all_x = np.roll(all_x, -min_y_index)
-    all_y = np.roll(all_y, -min_y_index)
-    ring_numbers = np.roll(ring_numbers, -min_y_index)
-    line_numbers = np.roll(line_numbers, -min_y_index)
+    # Points are already grouped ray by ray (increasing angle), each ray outer
+    # edge -> inner. Keep that grouping (a per-point angle sort interleaves the
+    # rings of one ray, since they share an angle up to float noise) and only
+    # rotate whole rays so the run starts on the ray holding the topmost point.
+    start_ray = line_numbers[int(np.argmin(all_y))]
+    shift = int(np.argmax(line_numbers == start_ray))
+    all_x = np.roll(all_x, -shift)
+    all_y = np.roll(all_y, -shift)
+    ring_numbers = np.roll(ring_numbers, -shift)
+    line_numbers = np.roll(line_numbers, -shift)
 
     points = [(float(x), float(y)) for x, y in zip(all_x, all_y)]
     orders = [

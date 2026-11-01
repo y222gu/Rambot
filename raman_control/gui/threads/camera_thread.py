@@ -233,6 +233,17 @@ class CameraThread(QThread):
         self._simulated = True
         self._sdk_ref_held = False
 
+        # Optional raw-frame listeners (calibration tab). Called on THIS
+        # thread with (raw_frame, timestamp, sdk_frame_count) for every new
+        # frame, BEFORE bit-depth scaling and flip/rotate/crop. Empty in
+        # normal operation, so the acquisition loop is unchanged.
+        self._raw_listeners: list = []
+        self._raw_lock = threading.Lock()
+        self._sim_frame_count = 0
+        # Sensor properties read once at connect (on this thread), so other
+        # threads never have to touch the SDK handle to report them.
+        self._sensor_info: dict = {}
+
     @property
     def is_connected(self) -> bool:
         with QMutexLocker(self._mutex):
@@ -346,6 +357,39 @@ class CameraThread(QThread):
                 return self._latest_frame.copy()
             return None
 
+    def add_raw_frame_listener(self, callback) -> None:
+        """Register ``callback(raw, timestamp, frame_count)``, called on the
+        camera thread for every new frame with an untouched copy of the
+        sensor buffer (native bit depth, full sensor, no flip/rotate/crop).
+        The callback must return quickly (e.g. hand off to a queue)."""
+        with self._raw_lock:
+            if callback not in self._raw_listeners:
+                self._raw_listeners.append(callback)
+
+    def remove_raw_frame_listener(self, callback) -> None:
+        with self._raw_lock:
+            if callback in self._raw_listeners:
+                self._raw_listeners.remove(callback)
+
+    @property
+    def sensor_info(self) -> dict:
+        """Sensor properties captured at connect (empty if not connected)."""
+        info = dict(self._sensor_info)
+        info['exposure_ms'] = self._config.exposure_time * 1000.0
+        return info
+
+    def _notify_raw_listeners(self, raw: np.ndarray, frame_count: int) -> None:
+        with self._raw_lock:
+            listeners = list(self._raw_listeners)
+        if not listeners:
+            return
+        t = time.time()
+        for cb in listeners:
+            try:
+                cb(raw, t, frame_count)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Raw frame listener error: {e}")
+
     def set_exposure(self, exposure_time: float):
         """Set camera exposure time in seconds."""
         self._config.exposure_time = exposure_time
@@ -408,6 +452,22 @@ class CameraThread(QThread):
 
                 logger.info(f"[{self._camera_id}] {self._image_width}x{self._image_height}, "
                             f"bit_depth={self._bit_depth}, sensor={self._camera.camera_sensor_type}")
+
+                info = {
+                    'camera_id': self._camera_id,
+                    'serial_number': serial,
+                    'width': self._image_width,
+                    'height': self._image_height,
+                    'bit_depth': self._bit_depth,
+                    'sensor_type': str(self._camera.camera_sensor_type),
+                }
+                for key, attr in (('model', 'model'), ('gain', 'gain'),
+                                  ('exposure_us_at_connect', 'exposure_time_us')):
+                    try:
+                        info[key] = getattr(self._camera, attr)
+                    except Exception:  # noqa: BLE001 - optional property
+                        pass
+                self._sensor_info = info
 
                 # Setup color processing if camera has Bayer sensor
                 try:
@@ -488,11 +548,20 @@ class CameraThread(QThread):
         """Acquire a single frame from the camera or simulated generator."""
         try:
             if self._simulated or self._camera is None:
-                return self._generate_simulated_frame()
+                image = self._generate_simulated_frame()
+                if self._raw_listeners:
+                    self._sim_frame_count += 1
+                    self._notify_raw_listeners(image.copy(), self._sim_frame_count)
+                return image
 
             frame = self._camera.get_pending_frame_or_null()
             if frame is None:
                 return None
+
+            if self._raw_listeners:
+                self._notify_raw_listeners(
+                    np.array(frame.image_buffer, copy=True),
+                    int(getattr(frame, 'frame_count', -1)))
 
             if self._is_color:
                 image = self._process_color_frame(frame)

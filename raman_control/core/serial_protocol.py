@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Optional, Any
+from typing import Callable, Optional, Any, List, Tuple
 import serial
 import serial.tools.list_ports
 
@@ -46,6 +46,26 @@ class GCodeCommand:
         # Ensure command ends with newline
         if not self.command.endswith('\n'):
             self.command = self.command.rstrip('\r\n') + '\n'
+
+
+@dataclass
+class GCodeSequence:
+    """Several G-code lines executed back-to-back as ONE queue item.
+
+    Nothing queued by another thread can run between the lines, so a modal
+    state set at the start (e.g. G91 relative mode) cannot leak into, or be
+    overridden by, an unrelated command. Each line is sent once (no retry):
+    re-sending a relative move would repeat the motion. Execution stops at
+    the first line that is not ACKed; ``finally_commands`` (e.g. G90) are
+    then still sent so the firmware is always left in its normal state.
+
+    The callback receives ``(success, results)`` where ``results`` is a list
+    of ``(line, acked, response)`` for every line that was sent, in order.
+    """
+    commands: List[str]
+    finally_commands: List[str] = field(default_factory=list)
+    callback: Optional[Callable[[bool, List[Tuple[str, bool, str]]], None]] = None
+    timeout_ms: int = 15000
 
 
 class SerialProtocol:
@@ -366,6 +386,79 @@ class SerialProtocol:
             logger.error(f"Sync command timed out: {command.strip()}")
             return False, "Timeout waiting for command completion"
 
+    def send_sequence(
+        self,
+        commands: List[str],
+        finally_commands: Optional[List[str]] = None,
+        callback: Optional[Callable[[bool, List[Tuple[str, bool, str]]], None]] = None,
+        timeout_ms: int = 15000,
+    ) -> None:
+        """Queue several commands to run as one uninterruptible block
+        (non-blocking). See :class:`GCodeSequence`."""
+        seq = GCodeSequence(
+            commands=list(commands),
+            finally_commands=list(finally_commands or []),
+            callback=callback,
+            timeout_ms=timeout_ms,
+        )
+        self._command_queue.put(seq)
+        logger.debug(f"Queued sequence: {' | '.join(seq.commands)}")
+
+    def send_immediate(self, command: str) -> bool:
+        """Write a command straight to the port, bypassing the queue.
+
+        For emergency use only (M112): the queue may be blocked behind an
+        M400/G4 for seconds. No ACK is awaited. Returns True if written.
+        """
+        line = command.rstrip('\r\n') + '\n'
+        try:
+            with self._lock:
+                if not self._serial or not self._serial.is_open:
+                    logger.error(f"Immediate send failed (port closed): {command}")
+                    return False
+                self._serial.write(line.encode('utf-8'))
+                self._serial.flush()
+            logger.warning(f"Sent immediately (out of band): {command.strip()}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Immediate send failed: {e}")
+            return False
+
+    def _run_sequence(self, seq: GCodeSequence) -> bool:
+        """Execute a GCodeSequence on the send worker thread."""
+        results: List[Tuple[str, bool, str]] = []
+        success = True
+        for line in seq.commands:
+            if not self._running:
+                success = False
+                break
+            sub = GCodeCommand(command=line, timeout_ms=seq.timeout_ms, retries=0)
+            acked = self._send_with_retry(sub)
+            results.append((line, acked, sub.response))
+            if not acked:
+                success = False
+                break
+            time.sleep(self.command_delay)
+        # Always restore state (e.g. G90), even after a failure. These are
+        # idempotent, so the normal retry policy applies.
+        for line in seq.finally_commands:
+            if not self._running:
+                success = False
+                break
+            sub = GCodeCommand(command=line, timeout_ms=5000,
+                               retries=self.max_retries)
+            acked = self._send_with_retry(sub)
+            results.append((line, acked, sub.response))
+            if not acked:
+                success = False
+            time.sleep(self.command_delay)
+        if seq.callback:
+            try:
+                seq.callback(success, results)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Sequence callback error: {e}")
+        return success
+
     def _send_worker(self) -> None:
         """Worker thread that processes the command queue."""
         logger.info("Send worker started")
@@ -376,6 +469,10 @@ class SerialProtocol:
                 cmd = self._command_queue.get(timeout=0.1)
 
                 if cmd is None:  # Sentinel for shutdown
+                    continue
+
+                if isinstance(cmd, GCodeSequence):
+                    self._run_sequence(cmd)
                     continue
 
                 self._current_command = cmd

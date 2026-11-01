@@ -43,6 +43,36 @@ def slide_at_rc(row: int, col_num: int) -> Optional[int]:
     return None
 
 
+def _build_deposition_order() -> List[Tuple[int, int]]:
+    """Every slide position (0-based row, 1-based column number) in the order
+    the Opentrons protocol deposits droplets (see build_deposition_order in
+    opentrons_protocol_generator/Opentrons_spotting_gui.py): slide by slide in
+    the 1-12 snake order above, each slide filled row-serpentine (its first
+    row left -> right, the next right -> left, ...)."""
+    order = []
+    for cgi, cg in enumerate(COL_GROUPS):
+        rgi_order = (range(len(ROW_GROUPS)) if cgi % 2 == 0
+                     else range(len(ROW_GROUPS) - 1, -1, -1))
+        for rgi in rgi_order:
+            for ri, row in enumerate(ROW_GROUPS[rgi]):
+                cols = cg if ri % 2 == 0 else list(reversed(cg))
+                order.extend((row, col_num) for col_num in cols)
+    return order
+
+
+_DEPOSITION_INDEX = {rc: i for i, rc in enumerate(_build_deposition_order())}
+
+
+def deposition_index(row: int, col_num: int) -> int:
+    """Position of a well (0-based row, 1-based column number) in the Opentrons
+    deposition sequence. Positions not on a slide sort after every slide
+    position, in row-major order."""
+    idx = _DEPOSITION_INDEX.get((row, col_num))
+    if idx is not None:
+        return idx
+    return len(_DEPOSITION_INDEX) + row * 1000 + col_num
+
+
 def slide_of_well(name: str) -> Optional[int]:
     """Slide number (1-12) a well (e.g. 'H10') sits on. None for a name that
     doesn't parse or isn't on any slide."""

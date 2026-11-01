@@ -48,6 +48,23 @@ def test_ring_count_is_bounded_by_rays_times_rings(disk_mask):
     assert len(orders) == len(pts)
 
 
+def test_ring_numbers_ray_by_ray_outer_to_inner(disk_mask):
+    """Points come ray by ray (consecutive rays), each ray outer edge -> inner,
+    starting on the ray with the topmost point."""
+    pts, orders = pl.generate_ring(
+        disk_mask, {'rays': 5, 'rings': 4, 'interval_px': 10, 'buffer_px': 0})
+    assert len(pts) == 5 * 4
+    lines = [o['line'] for o in orders]
+    rings = [o['ring'] for o in orders]
+    for k in range(5):
+        assert len(set(lines[4 * k:4 * k + 4])) == 1   # one ray per block of 4
+        assert rings[4 * k:4 * k + 4] == [1, 2, 3, 4]   # outer -> inner
+    ray_starts = lines[::4]
+    assert all((b - a) % 5 == 1 for a, b in zip(ray_starts, ray_starts[1:]))
+    top = int(np.argmin([y for _, y in pts]))
+    assert lines[top] == lines[0]
+
+
 # --- points stay inside the image; orders parallel points ------------------
 
 @pytest.mark.parametrize("pattern,params", [
