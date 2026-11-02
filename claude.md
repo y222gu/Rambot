@@ -99,6 +99,20 @@ QPushButton:pressed {
   - Real-time spectrum display needed
   - Critical for autofocus feedback
 
+- **Alternative spectrometer: Andor Kymera 328i + Newton DU920P CCD**
+  - Driven through Andor's `pyAndorSDK2` (camera) + `pyAndorSpectrograph`
+    (grating / wavelength drive); see `hardware/kymera_spectrometer.py`
+  - FVB single-scan readout, 1024 px, exposure set in seconds (GUI uses ms),
+    wavelength axis (nm) from the spectrograph calibration, lab defaults
+    grating 3 / centre 853 nm / CCD at -60 C
+  - Has NO laser: the Wasatch unit still provides the 785 nm excitation and is
+    then opened for laser control only (`hardware/wasatch_laser.py` on
+    `gui/threads/laser_thread.py`)
+  - Selection: `SpectrometerConfig.backend` = auto | wasatch | kymera (auto =
+    Wasatch if detected, else Kymera). `SpectrumThread` keeps one public API
+    for both; never touch a backend from outside the spectrum thread
+  - Only one process may hold the Newton: Andor SOLIS must be closed
+
 #### 3. Segmentation & Feedback
 - External segmentation model (image → object detection)
 - Image coordinates → physical coordinates conversion

@@ -161,6 +161,14 @@ class AcquisitionContext:
     af_prusa_reference_band_nm: Optional[Tuple[float, float]] = None
     af_nano_signal_band_nm: Optional[Tuple[float, float]] = None
     af_nano_reference_band_nm: Optional[Tuple[float, float]] = None
+    # Focus metric: 'ratio' (bands above) or 'entropy' (Shannon entropy over
+    # af_entropy_band_nm). A callable is accepted so the metric can follow the
+    # spectrometer that is actually connected (SpectrumThread.focus_metric).
+    af_metric: object = 'ratio'          # str or Callable[[], str]
+    af_entropy_band_nm: Optional[Tuple[float, float]] = None
+    # Extra metadata about the spectrometer in use (model, grating, CCD
+    # temperature...). Called when each metadata file is written.
+    spectrometer_metadata_provider: Optional[Callable[[], dict]] = None
 
     # Z scan ranges (lower, upper)
     wf_prusa_range: Tuple[float, float] = (0.0, 0.0)   # mm, widefield view
@@ -218,6 +226,24 @@ class AcquisitionContext:
         if stage == 'nano':
             return (self.af_nano_signal_band_nm, self.af_nano_reference_band_nm)
         return (self.af_prusa_signal_band_nm, self.af_prusa_reference_band_nm)
+
+    def resolve_af_metric(self) -> str:
+        """'ratio' or 'entropy' for the spectrometer in use."""
+        m = self.af_metric
+        if callable(m):
+            try:
+                m = m()
+            except Exception:  # noqa: BLE001
+                m = 'ratio'
+        return 'entropy' if str(m or 'ratio').lower() == 'entropy' else 'ratio'
+
+    def spectrometer_metadata(self) -> dict:
+        if self.spectrometer_metadata_provider is None:
+            return {}
+        try:
+            return dict(self.spectrometer_metadata_provider() or {})
+        except Exception:  # noqa: BLE001
+            return {}
 
 
 class AcquisitionWorker(QThread):
@@ -767,10 +793,11 @@ class AcquisitionWorker(QThread):
         wl_nm = self._ctx.wavelengths_nm_provider()
         try:
             signal_band, reference_band = self._ctx.af_bands(stage)
-            return float(AutofocusEngine.calculate_ratio_score(
-                wl_nm, median,
+            return float(AutofocusEngine.spectrum_focus_score(
+                self._ctx.resolve_af_metric(), wl_nm, median,
                 signal_band=signal_band,
-                reference_band=reference_band))
+                reference_band=reference_band,
+                entropy_band=self._ctx.af_entropy_band_nm))
         except Exception:  # noqa: BLE001
             return float('inf')
 
@@ -1396,6 +1423,10 @@ class AcquisitionWorker(QThread):
         }
         if z_index is not None:
             meta["Zstack index"] = z_index + 1
+        # Which spectrometer took this (Wasatch / Kymera), its grating, CCD
+        # temperature... so files from the two instruments are distinguishable.
+        meta.update(self._ctx.spectrometer_metadata())
+        meta["Autofocus metric"] = self._ctx.resolve_af_metric()
         meta["Spectra file"] = os.path.basename(spectra_path)
         try:
             with open(meta_path, "w") as f:

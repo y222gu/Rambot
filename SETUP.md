@@ -58,6 +58,36 @@ The `wasatch` package is installed from PyPI by `requirements.txt`. The
 spectrometer also needs the libusb-based driver installed by the Wasatch
 ENLIGHTEN installer (or Zadig) so `pyusb` can open the device.
 
+## 4b. Andor Kymera 328i + Newton DU920P (alternative spectrometer)
+
+The software can collect spectra with the Andor Kymera spectrograph and Newton
+CCD instead of the Wasatch (Settings -> Spectrometer -> "Spectrometer":
+Auto / Wasatch Photonics / Andor Kymera + Newton; Auto uses the Wasatch when
+one is detected and falls back to the Kymera). The excitation laser is always
+the one on the Wasatch spectrometer-laser unit: with the Kymera active, the
+Wasatch is opened for laser control only.
+
+Andor's Python wrappers are not on PyPI. They ship with the Andor SDK
+installer (also installed by Andor SOLIS) and are installed from there into
+the activated venv:
+
+```powershell
+pip install "C:\Program Files\Andor SDK\Python\pyAndorSDK2"
+pip install "C:\Program Files\Andor SDK\Python\pyAndorSpectrograph"
+```
+
+Both packages bundle the 64-bit DLLs they need (`atmcd64d.dll`,
+`atspectrograph.dll`); the Andor USB drivers come with the SDK / SOLIS
+installer. Installed version in the lab: 1.2.0 for both.
+
+Notes:
+- Only one program can hold the Newton camera. **Close Andor SOLIS** before
+  connecting from raman_control (Initialize fails otherwise).
+- Connecting takes 10 to 30 s: the SDK initialisation is about 10 s and a
+  grating change (turret move) another 15 to 20 s.
+- The CCD cooler is switched on at connect (set point in Settings, default
+  -60 C) and by default is kept on when the software disconnects.
+
 ## 5. Prusa stage and other serial devices
 
 Install the USB-serial drivers for the Prusa board and any Arduino-based

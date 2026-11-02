@@ -1,12 +1,29 @@
 """
-PyQt6 thread for spectrometer acquisition using Wasatch Photonics SDK.
+PyQt6 thread for spectrometer acquisition.
+
+The thread owns ONE spectrometer backend (see ``hardware/spectrometer_base``)
+and is the only code that touches it:
+
+* :class:`WasatchSpectrometer` (Wasatch Photonics unit, spectrometer + laser)
+* :class:`KymeraSpectrometer` (Andor Kymera 328i + Newton CCD)
+
+Which one is used follows ``SpectrometerConfig.backend``: 'wasatch', 'kymera',
+or 'auto' (Wasatch if detected, otherwise Kymera). The excitation laser is
+always the Wasatch laser: when the Wasatch is the active spectrometer, laser
+commands go through its backend on this thread; when the Kymera is active, a
+separate :class:`LaserThread` opens the Wasatch unit for laser control only
+and this thread forwards the laser calls to it.
+
+The public API (signals, acquire_frames / acquire_average, hold_live /
+release_live, set_integration_time, set_laser, set_laser_power_mw,
+wavelengths / wavelengths_nm) is the same for both spectrometers, so the GUI,
+autofocus and acquisition workers do not depend on the hardware in use.
 
 Provides non-blocking spectrum acquisition with:
-- Real Wasatch SDK integration (WasatchBus/WasatchDevice)
-- Debug mode fallback to simulated spectra
 - Integration time control
 - Laser power control (mW)
 - Thread-safe spectrum delivery via Qt signals
+- Debug fallback to simulated spectra (tests)
 """
 
 import threading
@@ -17,6 +34,10 @@ from PyQt6.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker
 
 from raman_control.config.hardware_config import SpectrometerConfig
 from raman_control.config.logging_config import get_logger
+from raman_control.hardware.spectrometer_base import (
+    BACKEND_AUTO, BACKEND_KYMERA, BACKEND_WASATCH, SpectrometerBackend,
+    SpectrometerStatus, wavelength_nm_to_wavenumber, wavenumber_to_wavelength_nm,
+)
 
 logger = get_logger('spectrum_thread')
 
@@ -31,6 +52,10 @@ class SpectrumThread(QThread):
         disconnected: Emitted when spectrometer disconnects
         error: Emitted on errors (error_message)
         laser_state_changed: Emitted when laser state changes (is_on)
+        laser_available_changed: Emitted when the excitation laser hardware
+            becomes reachable / unreachable (is_available)
+        status_changed: Emitted about once a second with a
+            :class:`SpectrometerStatus` snapshot (detector temperature, ...)
 
     Usage:
         spectrometer = SpectrumThread(config)
@@ -45,9 +70,13 @@ class SpectrumThread(QThread):
     disconnected = pyqtSignal()
     error = pyqtSignal(str)
     laser_state_changed = pyqtSignal(bool)
+    laser_available_changed = pyqtSignal(bool)
+    status_changed = pyqtSignal(object)  # SpectrometerStatus
+
+    _STATUS_INTERVAL_S = 1.0
 
     def __init__(self, config: Optional[SpectrometerConfig] = None,
-                 parent=None):
+                 parent=None, laser_thread=None):
         super().__init__(parent)
 
         self._config = config or SpectrometerConfig()
@@ -90,12 +119,29 @@ class SpectrumThread(QThread):
         # can't release each other's pause.
         self._live_holds = 0
 
-        # Wasatch SDK objects
-        self._device = None
-        self._fid = None  # FID = Feature Identification Device (hardware interface)
+        # Hardware backend (set in _connect_spectrometer).
+        self._backend: Optional[SpectrometerBackend] = None
+        self._backend_name = ""
+        # Laser routing. When the backend hosts the laser (Wasatch) the laser
+        # settings are applied on THIS thread through the backend. Otherwise the
+        # optional LaserThread (Wasatch in laser-only mode) is started and laser
+        # calls are forwarded to its queue straight from the setters, so a laser
+        # OFF never waits behind a long CCD exposure.
+        self._laser_thread = laser_thread
+        self._use_laser_thread = False
+        self._laser_available = False
+        if self._laser_thread is not None:
+            self._laser_thread.available_changed.connect(self._on_laser_thread_available)
+            self._laser_thread.laser_state_changed.connect(self._on_laser_thread_state)
+            self._laser_thread.error.connect(self.error)
 
         # Simulated mode flag
         self._simulated = False
+        self._last_status_emit = 0.0
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
     def is_connected(self) -> bool:
@@ -117,6 +163,40 @@ class SpectrumThread(QThread):
         return self._simulated
 
     @property
+    def backend_name(self) -> str:
+        """'wasatch' / 'kymera' once connected ('' before, 'simulated' in
+        simulation)."""
+        if self._simulated:
+            return 'simulated'
+        return self._backend_name
+
+    @property
+    def backend_label(self) -> str:
+        """Short model name for the status bar."""
+        if self._simulated:
+            return "Simulated"
+        if self._backend is not None:
+            return {BACKEND_WASATCH: "Wasatch", BACKEND_KYMERA: "Kymera"}.get(
+                self._backend.name, self._backend.name)
+        return ""
+
+    @property
+    def laser_available(self) -> bool:
+        """True when the excitation laser can be driven right now."""
+        if self._simulated:
+            return True
+        if self._use_laser_thread:
+            return self._laser_available
+        return self._backend is not None and self._backend.has_laser \
+            and self._backend.laser_available
+
+    @property
+    def focus_metric(self) -> str:
+        """'ratio' or 'entropy': the spectrometer-autofocus metric for the
+        connected hardware (Settings -> Spectrometer, 'auto' picks per device)."""
+        return self._config.resolve_af_metric(self._backend_name)
+
+    @property
     def wavelengths(self) -> np.ndarray:
         return self._wavelengths.copy()
 
@@ -130,10 +210,29 @@ class SpectrumThread(QThread):
         if self._wavelengths_nm is not None:
             return self._wavelengths_nm.copy()
         lam0 = self._config.excitation_wavelength_nm or 785.0
-        wn0 = 1e7 / lam0                                   # laser wavenumber
-        scattered = wn0 - self._wavelengths               # Stokes side
-        scattered = np.where(scattered == 0, np.nan, scattered)
-        return 1e7 / scattered
+        return wavenumber_to_wavelength_nm(self._wavelengths, lam0)
+
+    def metadata(self) -> dict:
+        """Spectrometer identity for capture / acquisition metadata files."""
+        if self._backend is None:
+            return {"Spectrometer": "Simulated" if self._simulated else ""}
+        try:
+            return self._backend.metadata()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Spectrometer metadata failed: {e}")
+            return {"Spectrometer": self._backend.model}
+
+    def status(self) -> Optional[SpectrometerStatus]:
+        if self._backend is None:
+            return None
+        try:
+            return self._backend.status()
+        except Exception:  # noqa: BLE001
+            return None
+
+    # ------------------------------------------------------------------
+    # Thread body
+    # ------------------------------------------------------------------
 
     def run(self):
         """Thread main loop."""
@@ -147,7 +246,8 @@ class SpectrumThread(QThread):
             return
 
         self.connected.emit()
-        logger.info(f"Spectrometer connected ({'simulated' if self._simulated else 'hardware'})")
+        logger.info(f"Spectrometer connected "
+                    f"({'simulated' if self._simulated else self._backend_name})")
 
         # Do NOT auto-start acquisition. The spectrum is acquired only after
         # the user clicks the play button (which calls start_acquisition()).
@@ -160,6 +260,7 @@ class SpectrumThread(QThread):
             # THIS thread, before any read, so the device is never accessed
             # concurrently from a caller thread and a get_line() here.
             self._apply_pending_settings()
+            self._poll_status()
 
             # Service an on-demand averaged-acquisition request first. This is
             # the path the auto-acquisition worker uses so its "Averaging"
@@ -199,7 +300,7 @@ class SpectrumThread(QThread):
                     )
 
                 # For simulated mode, sleep to simulate integration time
-                # For real hardware, get_line() already blocks for integration_time
+                # For real hardware, acquire() already blocks for integration_time
                 elapsed = time.time() - acq_start
                 if self._simulated:
                     wait_time = max(min_emit_interval,
@@ -221,7 +322,18 @@ class SpectrumThread(QThread):
         self._running = False
         self._acquiring = False
         self.set_laser(False)
+        # Interrupt a long CCD exposure so stop() does not wait for it.
+        backend = self._backend
+        if backend is not None:
+            try:
+                backend.abort()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Spectrometer abort failed: {e}")
         self.wait(5000)
+
+    # ------------------------------------------------------------------
+    # Acquisition control
+    # ------------------------------------------------------------------
 
     def start_acquisition(self):
         """Start continuous spectrum acquisition."""
@@ -253,6 +365,10 @@ class SpectrumThread(QThread):
             n = self._live_holds
         logger.debug(f"Live spectrum hold released (holds={n})")
 
+    # ------------------------------------------------------------------
+    # Settings (any thread; applied on the spectrum thread)
+    # ------------------------------------------------------------------
+
     def set_integration_time(self, time_ms: float):
         """Set integration time in milliseconds (applied on the spectrum
         thread between reads — never touches the device from the caller)."""
@@ -267,40 +383,94 @@ class SpectrumThread(QThread):
         logger.info(f"Laser power set to {power_percent}%")
 
     def set_laser_power_mw(self, power_mw: float):
-        """Set laser power in milliwatts (applied on the spectrum thread)."""
+        """Set laser power in milliwatts (applied on the laser's owner thread)."""
         self._config.laser_power_mw = power_mw
-        with QMutexLocker(self._mutex):
-            self._pending_settings['laser_power_mw'] = power_mw
+        if self._use_laser_thread and self._laser_thread is not None:
+            self._laser_thread.request_power_mw(power_mw)
+        else:
+            with QMutexLocker(self._mutex):
+                self._pending_settings['laser_power_mw'] = power_mw
         logger.info(f"Laser power set to {power_mw} mW")
 
     def set_laser(self, on: bool):
-        """Turn laser on or off (applied on the spectrum thread)."""
+        """Turn laser on or off (applied on the laser's owner thread)."""
+        on = bool(on)
+        if on and self._connected and not self._simulated and not self.laser_available:
+            logger.error("Laser ON requested but the excitation laser is not available")
+            self.error.emit("Excitation laser (Wasatch unit) not available")
+            with QMutexLocker(self._mutex):
+                self._laser_on = False
+            self.laser_state_changed.emit(False)
+            return
         with QMutexLocker(self._mutex):
             self._laser_on = on
-            self._pending_settings['laser_enable'] = on
+        if self._use_laser_thread and self._laser_thread is not None:
+            self._laser_thread.request_enable(on)
+        else:
+            with QMutexLocker(self._mutex):
+                self._pending_settings['laser_enable'] = on
         self.laser_state_changed.emit(on)
         logger.info(f"Laser {'ON' if on else 'OFF'}")
 
     def _apply_pending_settings(self):
         """Apply queued setting changes to the device. Runs ONLY on the spectrum
         thread (the run loop), so the USB device is never accessed concurrently
-        with a get_line() read."""
+        with an exposure."""
         with QMutexLocker(self._mutex):
             if not self._pending_settings:
                 return
             pending = self._pending_settings
             self._pending_settings = {}
-        if self._simulated or self._fid is None:
+        if self._simulated or self._backend is None:
             return
         try:
             if 'integration_time_ms' in pending:
-                self._fid.set_integration_time_ms(pending['integration_time_ms'])
-            if 'laser_power_mw' in pending:
-                self._fid.set_laser_power_mW(pending['laser_power_mw'])
-            if 'laser_enable' in pending:
-                self._fid.set_laser_enable(pending['laser_enable'])
+                self._backend.set_integration_time_ms(pending['integration_time_ms'])
+            if self._use_laser_thread and self._laser_thread is not None:
+                # Laser settings queued before connect: forward them now.
+                if 'laser_power_mw' in pending:
+                    self._laser_thread.request_power_mw(pending['laser_power_mw'])
+                if 'laser_enable' in pending:
+                    self._laser_thread.request_enable(pending['laser_enable'])
+            elif self._backend.has_laser:
+                if 'laser_power_mw' in pending:
+                    self._backend.set_laser_power_mw(pending['laser_power_mw'])
+                if 'laser_enable' in pending:
+                    self._backend.set_laser_enable(pending['laser_enable'])
+            elif pending.get('laser_enable'):
+                self.error.emit("No excitation laser available for this spectrometer")
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to apply spectrometer settings: {e}")
+
+    def _poll_status(self):
+        """Backend housekeeping (CCD temperature...) about once a second."""
+        if self._simulated or self._backend is None:
+            return
+        now = time.time()
+        if now - self._last_status_emit < self._STATUS_INTERVAL_S:
+            return
+        self._last_status_emit = now
+        try:
+            self._backend.poll()
+            self.status_changed.emit(self._backend.status())
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Spectrometer status poll failed: {e}")
+
+    def _on_laser_thread_available(self, available: bool):
+        self._laser_available = bool(available)
+        if self._use_laser_thread:
+            self.laser_available_changed.emit(self._laser_available)
+
+    def _on_laser_thread_state(self, on: bool):
+        with QMutexLocker(self._mutex):
+            changed = self._laser_on != bool(on)
+            self._laser_on = bool(on)
+        if changed:
+            self.laser_state_changed.emit(bool(on))
+
+    # ------------------------------------------------------------------
+    # On-demand capture
+    # ------------------------------------------------------------------
 
     def get_latest_spectrum(self) -> Optional[np.ndarray]:
         """Get the most recently acquired spectrum (thread-safe)."""
@@ -365,95 +535,109 @@ class SpectrumThread(QThread):
     # Internal: connect / disconnect / acquire
     # ------------------------------------------------------------------
 
+    def _candidate_backends(self):
+        """Backends to try, in order, for the configured selection."""
+        # Imported here so the SDKs are only loaded on the spectrum thread and
+        # a missing one does not break the application import.
+        from raman_control.hardware.wasatch_spectrometer import WasatchSpectrometer
+        from raman_control.hardware.kymera_spectrometer import KymeraSpectrometer
+
+        choice = (self._config.backend or BACKEND_AUTO).lower()
+        if choice == BACKEND_WASATCH:
+            return [WasatchSpectrometer(self._config)]
+        if choice == BACKEND_KYMERA:
+            return [KymeraSpectrometer(self._config)]
+        if choice != BACKEND_AUTO:
+            logger.warning(f"Unknown spectrometer backend '{choice}', using auto")
+        return [WasatchSpectrometer(self._config), KymeraSpectrometer(self._config)]
+
     def _connect_spectrometer(self) -> bool:
-        """Connect to the Wasatch spectrometer via SDK."""
-        try:
-            from wasatch.WasatchBus import WasatchBus
-            from wasatch.WasatchDevice import WasatchDevice
-            from wasatch.RealUSBDevice import RealUSBDevice
+        """Connect to the configured spectrometer (with 'auto' fallback)."""
+        candidates = self._candidate_backends()
+        backend = None
+        for cand in candidates:
+            logger.info(f"Trying spectrometer backend: {cand.name}")
+            try:
+                if cand.connect():
+                    backend = cand
+                    break
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Spectrometer backend {cand.name} failed: {e}")
+            if len(candidates) > 1:
+                logger.warning(f"Spectrometer '{cand.name}' not available, "
+                               f"trying the next one")
+        if backend is None:
+            logger.error("No spectrometer could be connected "
+                         f"(tried: {', '.join(c.name for c in candidates)})")
+            return False
 
-            logger.info("Searching for Wasatch spectrometer...")
-            bus = WasatchBus(use_sim=False)
+        self._backend = backend
+        self._backend_name = backend.name
+        self._setup_axes(backend)
 
-            if not bus.device_ids:
-                logger.error("No Wasatch spectrometer found")
-                return False
+        # Laser routing.
+        if backend.has_laser:
+            self._use_laser_thread = False
+            self._laser_available = backend.laser_available
+        elif self._laser_thread is not None:
+            self._use_laser_thread = True
+            if not self._laser_thread.isRunning():
+                self._laser_thread.start()
+            self._laser_available = self._laser_thread.is_available
+        else:
+            self._use_laser_thread = False
+            self._laser_available = False
+            logger.warning(f"Spectrometer '{backend.name}' has no laser and no "
+                           f"laser thread was provided: laser control disabled")
+        self.laser_available_changed.emit(self.laser_available)
 
-            device_id = bus.device_ids[0]
-            logger.info(f"Found spectrometer: {device_id}")
-
-            device_id.device_type = RealUSBDevice(device_id)
-            self._device = WasatchDevice(device_id)
-            ok = self._device.connect()
-
-            if not ok:
-                logger.error("Wasatch connect() failed")
-                self._device = None
-                return False
-
-            settings = self._device.settings
-
-            # Use wavenumbers (cm^-1) for Raman
-            if settings.wavenumbers is not None and len(settings.wavenumbers) > 0:
-                self._wavelengths = np.array(settings.wavenumbers, dtype=np.float64)
-                logger.info(f"Wavenumber range: {self._wavelengths[0]:.1f} - "
-                            f"{self._wavelengths[-1]:.1f} cm^-1 ({len(self._wavelengths)} pixels)")
-            elif settings.wavelengths is not None and len(settings.wavelengths) > 0:
-                self._wavelengths = np.array(settings.wavelengths, dtype=np.float64)
-                logger.info(f"Wavelength range: {self._wavelengths[0]:.1f} - "
-                            f"{self._wavelengths[-1]:.1f} nm ({len(self._wavelengths)} pixels)")
-            else:
-                logger.warning("No wavelength/wavenumber calibration from device, using pixel indices")
-                self._wavelengths = np.arange(2048, dtype=np.float64)
-
-            # Native wavelength (nm) axis for capture/export.
-            if settings.wavelengths is not None and len(settings.wavelengths) > 0:
-                self._wavelengths_nm = np.array(settings.wavelengths, dtype=np.float64)
-            else:
-                self._wavelengths_nm = None  # wavelengths_nm property will convert
-
-            self._fid = self._device.hardware
-
-            # Apply initial settings
-            self._fid.set_integration_time_ms(self._config.integration_time)
-            self._fid.set_laser_power_high_resolution(True)
-            self._fid.set_laser_power_mW(self._config.laser_power_mw)
-
-            logger.info(f"Integration time: {self._config.integration_time} ms, "
-                        f"Laser power: {self._config.laser_power_mw} mW")
-
-            self._simulated = False
+        self._simulated = False
+        with QMutexLocker(self._mutex):
             self._connected = True
-            return True
+        self._last_status_emit = 0.0
+        return True
 
-        except ImportError:
-            logger.error("Wasatch SDK (wasatch package) not installed")
-            return False
-
-        except Exception as e:
-            logger.error(f"Spectrometer connection error: {e}")
-            return False
+    def _setup_axes(self, backend: SpectrometerBackend):
+        """Fill the cm⁻¹ and nm axes from the backend's calibration."""
+        lam0 = self._config.excitation_wavelength_nm or 785.0
+        wl_nm = backend.wavelengths_nm
+        device_wn = getattr(backend, 'device_wavenumbers', None)
+        if wl_nm is not None and len(wl_nm):
+            self._wavelengths_nm = np.asarray(wl_nm, dtype=np.float64)
+        else:
+            self._wavelengths_nm = None
+        if device_wn is not None and len(device_wn):
+            # Wasatch units ship their own Raman-shift calibration; keep using it.
+            self._wavelengths = np.asarray(device_wn, dtype=np.float64)
+        elif self._wavelengths_nm is not None:
+            self._wavelengths = wavelength_nm_to_wavenumber(self._wavelengths_nm, lam0)
+        else:
+            logger.warning("No wavelength calibration from the spectrometer, "
+                           "using pixel indices")
+            self._wavelengths = np.arange(max(1, backend.pixels), dtype=np.float64)
+        logger.info(f"Spectrometer axis: {len(self._wavelengths)} px, "
+                    f"{self._wavelengths[0]:.1f} - {self._wavelengths[-1]:.1f} cm^-1")
 
     def _disconnect_spectrometer(self):
-        """Disconnect from the spectrometer."""
+        """Disconnect from the spectrometer (and the laser-only thread)."""
         try:
-            if not self._simulated and self._fid is not None:
+            if self._laser_thread is not None and self._laser_thread.isRunning():
+                self._laser_thread.stop()
+            if not self._simulated and self._backend is not None:
                 try:
-                    self._fid.set_laser_enable(False)
-                except Exception as e:
+                    if self._backend.has_laser:
+                        self._backend.set_laser_enable(False)
+                except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to disable laser during disconnect: {e}")
-
-            if not self._simulated and self._device is not None:
                 try:
-                    self._device.disconnect()
-                except Exception as e:
-                    logger.warning(f"Wasatch disconnect error: {e}")
-
-            self._fid = None
-            self._device = None
-            self._connected = False
-
-        except Exception as e:
+                    self._backend.disconnect()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Spectrometer disconnect error: {e}")
+            self._backend = None
+            self._use_laser_thread = False
+            with QMutexLocker(self._mutex):
+                self._connected = False
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Spectrometer disconnect error: {e}")
 
     def _acquire_spectrum(self) -> Optional[np.ndarray]:
@@ -461,30 +645,14 @@ class SpectrumThread(QThread):
         try:
             if self._simulated:
                 return self._generate_simulated_spectrum()
-
-            if self._fid is None:
+            if self._backend is None:
                 return None
-
-            # get_line() blocks for integration_time duration
-            response = self._fid.get_line()
-            if response is None:
-                logger.warning("get_line() returned None")
+            # Blocks for the integration time (on this, the owner, thread).
+            spectrum = self._backend.acquire()
+            if spectrum is None:
                 return None
-
-            # Extract spectrum data from response
-            if hasattr(response, 'data') and hasattr(response.data, 'spectrum'):
-                spectrum = np.array(response.data.spectrum, dtype=np.float32)
-            elif hasattr(response, 'data') and isinstance(response.data, (list, np.ndarray)):
-                spectrum = np.array(response.data, dtype=np.float32)
-            elif isinstance(response, (list, np.ndarray)):
-                spectrum = np.array(response, dtype=np.float32)
-            else:
-                logger.warning(f"Unexpected get_line() response type: {type(response)}")
-                return None
-
-            return spectrum
-
-        except Exception as e:
+            return np.asarray(spectrum, dtype=np.float32)
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Spectrum acquisition error: {e}")
             return None
 

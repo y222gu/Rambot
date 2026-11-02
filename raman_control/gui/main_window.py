@@ -28,6 +28,7 @@ from raman_control.gui.tooltip_style import install_fast_tooltips
 from raman_control.gui.threads.motion_thread import MotionThread
 from raman_control.gui.threads.camera_thread import CameraThread
 from raman_control.gui.threads.spectrum_thread import SpectrumThread
+from raman_control.gui.threads.laser_thread import LaserThread
 from raman_control.gui.threads.autofocus_thread import AutofocusWorker
 from raman_control.gui.threads.acquisition_thread import (
     AcquisitionWorker, AcquisitionContext)
@@ -74,6 +75,7 @@ class DeviceIndicator(QWidget):
         layout.addWidget(self._label)
         self._connected = False
         self._simulated = False
+        self._detail = ""  # e.g. the spectrometer model / CCD temperature
 
     def _set_status(self, connected: bool):
         color = COLORS['success'] if connected else '#5c5c5c'
@@ -87,14 +89,29 @@ class DeviceIndicator(QWidget):
     def set_connected(self, connected: bool, simulated: bool = False):
         self._connected = connected
         self._simulated = simulated
+        if not connected:
+            self._detail = ""
         self._set_status(connected)
+        self._render()
 
+    def set_detail(self, detail: str):
+        """Extra text shown after the name while connected, e.g.
+        'Spectrometer (Kymera -60°C)'."""
+        self._detail = detail or ""
+        self._render()
+
+    def _render(self):
+        connected, simulated = self._connected, self._simulated
+        name = self._name
+        if connected and self._detail:
+            name = (f'{self._name} <span style="color: {COLORS["text_secondary"]};">'
+                    f'({self._detail})</span>')
         if connected and simulated:
             # Show "(SIM)" in orange next to device name
-            self._label.setText(f'{self._name} <span style="color: {COLORS["warning"]};">(SIM)</span>')
+            self._label.setText(f'{name} <span style="color: {COLORS["warning"]};">(SIM)</span>')
             self._label.setStyleSheet(f'color: {COLORS["text_primary"]}; font-size: 11px;')
         else:
-            self._label.setText(self._name)
+            self._label.setText(name)
             color = COLORS['text_primary'] if connected else COLORS['text_secondary']
             self._label.setStyleSheet(f'color: {color}; font-size: 11px;')
 
@@ -176,6 +193,11 @@ class StatusBarWidget(QWidget):
     def set_device_connected(self, device: str, connected: bool, simulated: bool = False):
         if device in self._device_indicators:
             self._device_indicators[device].set_connected(connected, simulated)
+
+    def set_device_detail(self, device: str, detail: str):
+        """Show extra text next to a device name (model, temperature...)."""
+        if device in self._device_indicators:
+            self._device_indicators[device].set_detail(detail)
 
     def set_progress(self, value: int, text: str = ""):
         self._progress_bar.setValue(value)
@@ -261,8 +283,14 @@ class MainWindow(QMainWindow):
             config=self._config.objective_camera,
             dll_dir=self._config.dll_dir,
         )
+        # Excitation laser in laser-only mode: used when the active
+        # spectrometer is the Andor Kymera (no laser of its own) and the
+        # Wasatch unit only provides the 785 nm excitation. The spectrum thread
+        # starts it when (and only when) its connected backend has no laser.
+        self._laser_thread = LaserThread(self._config.spectrometer)
         self._spectrometer = SpectrumThread(
             config=self._config.spectrometer,
+            laser_thread=self._laser_thread,
         )
         # LED illumination thread — its control widget lives at the far-left of
         # the status bar (added in _setup_statusbar).
@@ -455,6 +483,13 @@ class MainWindow(QMainWindow):
         self._spectrometer.connected.connect(self._on_spectrometer_connected)
         self._spectrometer.disconnected.connect(
             lambda: self._status_widget.set_device_connected('Spectrometer', False))
+        self._spectrometer.disconnected.connect(
+            lambda: self._status_widget.set_device_detail('Spectrometer', ''))
+        self._spectrometer.status_changed.connect(self._on_spectrometer_status)
+        self._spectrometer.laser_available_changed.connect(
+            self._on_laser_available_changed)
+        self._spectrometer.error.connect(
+            lambda msg: self._status_widget.show_message(f"⚠ Spectrometer: {msg}", 6000))
 
         # Live view camera switch
         self._live_view.camera_switch_requested.connect(self._on_camera_switch_requested)
@@ -538,6 +573,28 @@ class MainWindow(QMainWindow):
     def _on_spectrometer_connected(self):
         sim = self._spectrometer.is_simulated
         self._status_widget.set_device_connected('Spectrometer', True, simulated=sim)
+        label = self._spectrometer.backend_label
+        self._status_widget.set_device_detail('Spectrometer', label)
+        self._status_widget.show_message(f"Spectrometer connected: {label}", 5000)
+        logger.info(f"Spectrometer backend in use: {self._spectrometer.backend_name}, "
+                    f"focus metric: {self._spectrometer.focus_metric}")
+
+    def _on_spectrometer_status(self, status):
+        """Live detector temperature (Kymera/Newton) in the status bar."""
+        label = self._spectrometer.backend_label
+        temp = getattr(status, 'detector_temperature_c', None)
+        if temp is None:
+            self._status_widget.set_device_detail('Spectrometer', label)
+            return
+        stable = getattr(status, 'temperature_stable', None)
+        mark = "" if stable else " (cooling)"
+        self._status_widget.set_device_detail(
+            'Spectrometer', f"{label} {temp:.0f}°C{mark}")
+
+    def _on_laser_available_changed(self, available: bool):
+        if not available and self._spectrometer.is_connected:
+            self._status_widget.show_message(
+                "Excitation laser (Wasatch unit) not available", 6000)
 
     _TOOLBAR_BTN_CONNECT = '''
         QPushButton {
@@ -763,12 +820,16 @@ class MainWindow(QMainWindow):
         nano_z = None
         if self._nanodrive is not None and self._nanodrive.is_connected:
             nano_z = self._nanodrive.position
-        return {
+        meta = {
             "stage_x_mm": round(x, 4),
             "stage_y_mm": round(y, 4),
             "stage_z_mm": round(z, 4),          # coarse / autofocus position
             "nanodrive_z_um": round(nano_z, 3) if nano_z is not None else None,
         }
+        # Which spectrometer took the capture (Wasatch / Kymera + grating,
+        # CCD temperature...). Cached values only, no hardware call.
+        meta.update(self._spectrometer.metadata())
+        return meta
 
     def _on_stage_error(self, message: str):
         if "not connected" not in message.lower():
@@ -1083,10 +1144,13 @@ class MainWindow(QMainWindow):
         wl_nm = spec.wavelengths_nm
         try:
             spec_cfg = self._config.spectrometer
-            return float(AutofocusEngine.calculate_ratio_score(
-                wl_nm, median,
+            # Metric follows the connected spectrometer: band ratio on the
+            # Wasatch, spectral entropy on the Kymera (or as forced in Settings).
+            return float(AutofocusEngine.spectrum_focus_score(
+                spec.focus_metric, wl_nm, median,
                 signal_band=spec_cfg.af_signal_band(stage),
-                reference_band=spec_cfg.af_reference_band(stage)))
+                reference_band=spec_cfg.af_reference_band(stage),
+                entropy_band=spec_cfg.af_entropy_band()))
         except Exception:  # noqa: BLE001
             return float('inf')
 
@@ -1206,6 +1270,11 @@ class MainWindow(QMainWindow):
             af_nano_signal_band_nm=self._config.spectrometer.af_signal_band('nano'),
             af_nano_reference_band_nm=(
                 self._config.spectrometer.af_reference_band('nano')),
+            # Metric per connected spectrometer (ratio / entropy), its band,
+            # and the spectrometer identity for the metadata files.
+            af_metric=lambda: self._spectrometer.focus_metric,
+            af_entropy_band_nm=self._config.spectrometer.af_entropy_band(),
+            spectrometer_metadata_provider=self._spectrometer.metadata,
             wf_prusa_range=(wf_lo, wf_up),
             obj_prusa_range=(obj_lo, obj_up),
             nano_range=(nano_lo, nano_up),
@@ -1334,6 +1403,11 @@ class MainWindow(QMainWindow):
             af_nano_signal_band_nm=self._config.spectrometer.af_signal_band('nano'),
             af_nano_reference_band_nm=(
                 self._config.spectrometer.af_reference_band('nano')),
+            # Metric per connected spectrometer (ratio / entropy), its band,
+            # and the spectrometer identity for the metadata files.
+            af_metric=lambda: self._spectrometer.focus_metric,
+            af_entropy_band_nm=self._config.spectrometer.af_entropy_band(),
+            spectrometer_metadata_provider=self._spectrometer.metadata,
             wf_prusa_range=(wf_lo, wf_up),
             obj_prusa_range=(obj_lo, obj_up),
             nano_range=(nano_lo, nano_up),

@@ -145,13 +145,50 @@ class CameraConfig:
 
 
 @dataclass
+class KymeraConfig:
+    """Andor Kymera 328i spectrograph + Newton DU920P CCD (the alternative
+    spectrometer). Values mirror the lab's automation notebooks."""
+    grating: int = 3                      # turret position (1-based)
+    center_wavelength_nm: float = 853.0   # grating centre wavelength
+    cooler_on: bool = True
+    target_temperature_c: float = -60.0   # CCD set point
+    # Keep the set point when the camera is shut down (Andor cooler mode 1),
+    # so a disconnect never leaves the sensor warming uncontrolled.
+    keep_cooler_on_shutdown: bool = True
+    # Extra time allowed for one exposure beyond 2x the exposure itself before
+    # it is declared hung and aborted (readout + transfer margin).
+    acquisition_timeout_margin_s: float = 5.0
+    # Optional folder holding atmcd64d.dll / atspectrograph.dll. Empty = use
+    # the DLLs bundled with the pyAndorSDK2 / pyAndorSpectrograph packages,
+    # then C:\Program Files\Andor SDK.
+    sdk_dir: str = ""
+
+
+@dataclass
 class SpectrometerConfig:
-    """Configuration for Wasatch spectrometer."""
+    """Configuration for the Raman spectrometer and excitation laser.
+
+    ``backend`` selects the spectrometer: 'wasatch' (Wasatch Photonics unit),
+    'kymera' (Andor Kymera + Newton), or 'auto' (Wasatch if detected, else
+    Kymera). The excitation laser is always the one on the Wasatch unit; when
+    the Kymera is the active spectrometer the Wasatch is opened for laser
+    control only.
+    """
+    backend: str = 'auto'  # 'auto' | 'wasatch' | 'kymera'
     integration_time: float = 5000.0  # ms
     laser_power: float = 50.0  # percent
     laser_power_mw: float = 450.0  # mW (default laser power)
     averaging: int = 1
     excitation_wavelength_nm: float = 785.0  # laser line, for cm⁻¹ ↔ nm
+    kymera: KymeraConfig = field(default_factory=KymeraConfig)
+
+    # Spectrometer autofocus focus metric: 'ratio' (signal band / reference
+    # band, the Wasatch default below), 'entropy' (Shannon entropy of the
+    # entropy band, the lab's Kymera notebooks), or 'auto' (ratio on the
+    # Wasatch, entropy on the Kymera). Both are MINIMISED.
+    af_metric: str = 'auto'  # 'auto' | 'ratio' | 'entropy'
+    af_entropy_min_nm: float = 830.0
+    af_entropy_max_nm: float = 920.0
 
     # Spectrometer autofocus focus score: the summed intensity of the SIGNAL
     # band divided by that of the REFERENCE band. The scan minimises it, so
@@ -186,6 +223,18 @@ class SpectrometerConfig:
         if stage == 'nano':
             return (self.af_nano_reference_min_nm, self.af_nano_reference_max_nm)
         return (self.af_prusa_reference_min_nm, self.af_prusa_reference_max_nm)
+
+    def af_entropy_band(self) -> tuple:
+        """(min_nm, max_nm) of the band the entropy focus metric is taken over."""
+        return (self.af_entropy_min_nm, self.af_entropy_max_nm)
+
+    def resolve_af_metric(self, backend_name: str = '') -> str:
+        """The focus metric to use ('ratio' / 'entropy') given the spectrometer
+        that is actually connected ('wasatch' / 'kymera')."""
+        metric = (self.af_metric or 'auto').lower()
+        if metric in ('ratio', 'entropy'):
+            return metric
+        return 'entropy' if backend_name == 'kymera' else 'ratio'
 
 
 @dataclass
@@ -317,10 +366,14 @@ class HardwareConfig:
         for key, value in data.items():
             if key in nested_map and isinstance(value, dict):
                 dc_cls = nested_map[key]
-                # Handle second-level nesting (StageConfig.serial)
+                # Handle second-level nesting (StageConfig.serial,
+                # SpectrometerConfig.kymera)
                 if key == 'stage' and 'serial' in value and isinstance(value['serial'], dict):
                     value = dict(value)
                     value['serial'] = SerialConfig(**value['serial'])
+                if key == 'spectrometer' and isinstance(value.get('kymera'), dict):
+                    value = dict(value)
+                    value['kymera'] = KymeraConfig(**value['kymera'])
                 # Convert tuple fields stored as lists back to tuples
                 for f in fields(dc_cls):
                     if f.name in value and (f.type == 'tuple' or (hasattr(f.type, '__origin__') and f.type is tuple)):

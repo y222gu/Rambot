@@ -12,14 +12,15 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QFormLayout, QGroupBox, QScrollArea, QLabel, QPushButton,
     QDoubleSpinBox, QSpinBox, QCheckBox, QLineEdit, QFileDialog,
-    QDialogButtonBox, QSizePolicy,
+    QDialogButtonBox, QSizePolicy, QComboBox,
 )
 from PyQt6.QtCore import Qt
 
 from raman_control.config.hardware_config import (
     HardwareConfig, StageConfig, SerialConfig, CameraConfig,
-    NanoDriveConfig, SpectrometerConfig, SampleDropConfig,
+    NanoDriveConfig, SpectrometerConfig, SampleDropConfig, KymeraConfig,
 )
+from raman_control.hardware.spectrometer_base import BACKEND_CHOICES, BACKEND_LABELS
 from raman_control.config.logging_config import get_logger
 from raman_control.config.offset_calibration import get_offset_calibration
 from raman_control.gui.styles import COLORS
@@ -86,10 +87,44 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
     'max_position': ("Max position (um)", "Hardware safe max"),
     'stabilization_time': ("Stabilization time (s)", "Settling time after move"),
     # Spectrometer
+    'backend': (
+        "Spectrometer",
+        "Which spectrometer collects the Raman signal. Auto tries the Wasatch "
+        "Photonics unit first and falls back to the Andor Kymera + Newton if no "
+        "Wasatch is detected. The excitation laser is always the Wasatch laser. "
+        "Takes effect on the next Connect."),
     'integration_time': ("Integration time (ms)", ""),
     'laser_power': ("Laser power (%)", ""),
     'laser_power_mw': ("Laser power (mW)", ""),
     'averaging': ("Averaging", "Number of spectra to average"),
+    'excitation_wavelength_nm': ("Excitation wavelength (nm)",
+                                 "Laser line used to convert nm to Raman shift"),
+    'af_metric': (
+        "Focus metric",
+        "Score the spectrometer autofocus minimises. Ratio: signal band / "
+        "reference band (bands below). Entropy: Shannon entropy of the entropy "
+        "band (sharp peaks = low entropy), the method of the Kymera notebooks. "
+        "Auto: ratio on the Wasatch, entropy on the Kymera."),
+    'af_entropy_min_nm': ("Entropy band min (nm)",
+                          "Lower edge of the band the entropy metric is computed over"),
+    'af_entropy_max_nm': ("Entropy band max (nm)",
+                          "Upper edge of the band the entropy metric is computed over"),
+    # Kymera / Newton
+    'grating': ("Grating", "Kymera turret position (1-based), lab default 3"),
+    'center_wavelength_nm': ("Center wavelength (nm)",
+                             "Grating centre wavelength, lab default 853 nm"),
+    'cooler_on': ("Cooler on", "Start the Newton CCD cooler on connect"),
+    'target_temperature_c': ("Target temperature (C)", "CCD set point, lab default -60"),
+    'keep_cooler_on_shutdown': (
+        "Keep cooler on at shutdown",
+        "Keep the CCD at its set point when the camera is shut down instead "
+        "of letting it warm uncontrolled"),
+    'acquisition_timeout_margin_s': (
+        "Acquisition timeout margin (s)",
+        "One exposure is abandoned after 2 x exposure + this margin"),
+    'sdk_dir': ("Andor SDK DLL folder",
+                "Optional folder with atmcd64d.dll / atspectrograph.dll. Empty = "
+                "the DLLs bundled with the pyAndorSDK2 packages"),
     'af_prusa_signal_min_nm': (
         "Signal band min (nm)",
         "Lower edge of the SIGNAL band (numerator) for the Prusa coarse "
@@ -152,6 +187,18 @@ _AF_BAND_FIELDS = {
     'af_prusa_reference_min_nm', 'af_prusa_reference_max_nm',
     'af_nano_signal_min_nm', 'af_nano_signal_max_nm',
     'af_nano_reference_min_nm', 'af_nano_reference_max_nm',
+    'af_metric', 'af_entropy_min_nm', 'af_entropy_max_nm',
+}
+
+# String fields edited with a drop-down instead of a free-text box:
+# field name -> list of (stored value, label).
+_COMBO_FIELDS: Dict[str, List[Tuple[str, str]]] = {
+    'backend': [(b, BACKEND_LABELS[b]) for b in BACKEND_CHOICES],
+    'af_metric': [
+        ('auto', "Auto (ratio on Wasatch, entropy on Kymera)"),
+        ('ratio', "Band ratio (signal / reference)"),
+        ('entropy', "Spectral entropy"),
+    ],
 }
 
 
@@ -398,19 +445,53 @@ class SettingsDialog(QDialog):
         tab = self._make_scroll_tab()
         layout = tab.layout()
 
-        group = self._make_group("Spectrometer (Wasatch Photonics)")
+        group = self._make_group("Spectrometer")
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # Which instrument collects the spectra (drop-down), then the shared
+        # acquisition / laser settings.
+        self._add_field(form, 'backend', self._config.spectrometer.backend,
+                        "spectrometer.backend")
         self._add_dataclass_fields(form, self._config.spectrometer, "spectrometer",
-                                   exclude=_AF_BAND_FIELDS)
+                                   exclude=_AF_BAND_FIELDS | {'backend'})
         group.setLayout(form)
         layout.addWidget(group)
+
+        laser_note = QLabel(
+            "The excitation laser is always the one on the Wasatch "
+            "spectrometer-laser unit. With the Kymera selected the Wasatch is "
+            "opened for laser control only. Changing the spectrometer takes "
+            "effect on the next Connect.")
+        laser_note.setWordWrap(True)
+        laser_note.setStyleSheet(
+            f"color: {COLORS.get('text_secondary', '#a0a0a0')}; font-size: 11px;"
+            " padding: 2px 4px;")
+        layout.addWidget(laser_note)
+
+        # Andor Kymera + Newton settings (used when that backend connects).
+        k_group = self._make_group("Andor Kymera 328i + Newton DU920P")
+        k_form = QFormLayout()
+        k_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._add_dataclass_fields(k_form, self._config.spectrometer.kymera,
+                                   "spectrometer.kymera")
+        k_group.setLayout(k_form)
+        layout.addWidget(k_group)
+
+        # Focus metric selection + entropy band.
+        m_group = self._make_group("Autofocus Focus Metric")
+        m_form = QFormLayout()
+        m_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        for name in ('af_metric', 'af_entropy_min_nm', 'af_entropy_max_nm'):
+            self._add_field(m_form, name, getattr(self._config.spectrometer, name),
+                            f"spectrometer.{name}")
+        m_group.setLayout(m_form)
+        layout.addWidget(m_group)
 
         # Focus-score bands get their own groups: they define the metric each
         # spectrometer autofocus minimises, not an acquisition setting. The
         # coarse (Prusa) and fine (NanoDrive) scans are tuned separately.
         note = QLabel(
-            "Focus score = summed intensity of the signal band / summed "
+            "Ratio focus score = summed intensity of the signal band / summed "
             "intensity of the reference band. Each scan keeps the Z with the "
             "LOWEST score. Bands are inclusive, in nanometres. The two scans "
             "have independent bands; set them the same to score alike. "
@@ -491,7 +572,15 @@ class SettingsDialog(QDialog):
         tooltip = _tooltip_for(name)
         widget: QWidget
 
-        if isinstance(value, bool):
+        if name in _COMBO_FIELDS:
+            widget = QComboBox()
+            for stored, text in _COMBO_FIELDS[name]:
+                widget.addItem(text, stored)
+            idx = widget.findData(value)
+            widget.setCurrentIndex(idx if idx >= 0 else 0)
+            if tooltip:
+                widget.setToolTip(tooltip)
+        elif isinstance(value, bool):
             widget = QCheckBox()
             widget.setChecked(value)
             if tooltip:
@@ -537,7 +626,9 @@ class SettingsDialog(QDialog):
         """Read current values from all widgets as a dotted-key dict."""
         result: Dict[str, Any] = {}
         for dotted_key, widget in self._widgets:
-            if isinstance(widget, QCheckBox):
+            if isinstance(widget, QComboBox):
+                result[dotted_key] = widget.currentData()
+            elif isinstance(widget, QCheckBox):
                 result[dotted_key] = widget.isChecked()
             elif isinstance(widget, QDoubleSpinBox):
                 result[dotted_key] = widget.value()
@@ -564,7 +655,10 @@ class SettingsDialog(QDialog):
             except AttributeError:
                 continue
 
-            if isinstance(widget, QCheckBox):
+            if isinstance(widget, QComboBox):
+                idx = widget.findData(obj)
+                widget.setCurrentIndex(idx if idx >= 0 else 0)
+            elif isinstance(widget, QCheckBox):
                 widget.setChecked(bool(obj))
             elif isinstance(widget, QDoubleSpinBox):
                 widget.setValue(float(obj))

@@ -350,17 +350,48 @@ class AutofocusEngine(QObject):
             return float('inf')
         return float(np.sum(peak) / denom)
 
+    DEFAULT_ENTROPY_BAND_NM = (830.0, 920.0)
+
     @staticmethod
     def calculate_entropy(wavelength_nm: np.ndarray,
-                          intensity: np.ndarray) -> float:
-        """Shannon entropy of the 830–920 nm band (noodlepy). Minimised."""
+                          intensity: np.ndarray,
+                          band: Optional[Tuple[float, float]] = None) -> float:
+        """Shannon entropy of the spectrum over ``band`` (nm, inclusive;
+        default 830–920 nm as in noodlepy). Minimised: a focused Raman
+        spectrum has sharp peaks (low entropy), a defocused one is flat.
+
+        This is the metric the lab's Kymera notebooks autofocus with. Returns
+        ``inf`` (worst) when the band selects no pixels or has no signal.
+        """
         if wavelength_nm is None or intensity is None:
+            return float('inf')
+        lo, hi = band or AutofocusEngine.DEFAULT_ENTROPY_BAND_NM
+        if hi < lo:
             return float('inf')
         wl = np.asarray(wavelength_nm)
         inten = np.asarray(intensity, dtype=float)
-        crop = inten[(wl >= 830) & (wl <= 920)]
+        crop = inten[(wl >= lo) & (wl <= hi)]
+        if crop.size == 0:
+            return float('inf')
+        crop = np.clip(crop, 0, None)
         total = float(np.sum(crop))
         if total <= 0:
             return float('inf')
         p = crop / total
         return float(-np.sum(p * np.log2(p + 1e-12)))
+
+    @staticmethod
+    def spectrum_focus_score(metric: str, wavelength_nm: np.ndarray,
+                             intensity: np.ndarray,
+                             signal_band: Optional[Tuple[float, float]] = None,
+                             reference_band: Optional[Tuple[float, float]] = None,
+                             entropy_band: Optional[Tuple[float, float]] = None
+                             ) -> float:
+        """Dispatch to the configured spectrometer focus metric ('ratio' or
+        'entropy'); both are minimised by the autofocus scan."""
+        if (metric or 'ratio').lower() == 'entropy':
+            return AutofocusEngine.calculate_entropy(wavelength_nm, intensity,
+                                                     band=entropy_band)
+        return AutofocusEngine.calculate_ratio_score(
+            wavelength_nm, intensity, signal_band=signal_band,
+            reference_band=reference_band)

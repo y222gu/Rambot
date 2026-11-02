@@ -663,6 +663,8 @@ class SpectrumViewerWidget(QWidget):
         self._spectrum_thread.connected.connect(self._on_connected)
         self._spectrum_thread.disconnected.connect(self._on_disconnected)
         self._spectrum_thread.laser_state_changed.connect(self._on_laser_state_changed)
+        self._spectrum_thread.laser_available_changed.connect(
+            self._on_laser_available_changed)
 
     # --- X axis units (Raman shift cm⁻¹ <-> wavelength nm) -------------------
 
@@ -735,8 +737,13 @@ class SpectrumViewerWidget(QWidget):
     def _on_connected(self):
         """Handle spectrometer connection."""
         self._acq_btn.setEnabled(True)
-        self._laser_btn.setEnabled(True)
+        # The laser button follows the laser hardware, which may be a separate
+        # unit from the spectrometer (Kymera spectra + Wasatch laser).
+        self._on_laser_available_changed(self._spectrum_thread.laser_available)
         self._capture_btn.setEnabled(True)
+        label = getattr(self._spectrum_thread, 'backend_label', '')
+        if label:
+            self._af_panel.setTitle(f"Spectrometer Autofocus ({label})")
         # Auto-start acquisition on connect and reflect it on the play button
         # (checked + pause icon / filled style).
         if self._spectrum_thread:
@@ -755,12 +762,26 @@ class SpectrumViewerWidget(QWidget):
         self._laser_btn.setChecked(False)
         self._laser_btn.setEnabled(False)
         self._capture_btn.setEnabled(False)
+        self._af_panel.setTitle("Spectrometer Autofocus")
         logger.info("Spectrometer disconnected")
 
     def _on_laser_state_changed(self, is_on: bool):
         """Handle laser state change."""
         self._laser_btn.setChecked(is_on)
         self._laser_btn.setText("Turn Laser Off" if is_on else "Turn Laser On")
+
+    def _on_laser_available_changed(self, available: bool):
+        """Enable the laser button only while the excitation laser (the
+        Wasatch unit) is reachable."""
+        self._laser_btn.setEnabled(bool(available))
+        if available:
+            self._laser_btn.setToolTip("")
+        else:
+            self._laser_btn.setChecked(False)
+            self._laser_btn.setText("Turn Laser On")
+            self._laser_btn.setToolTip(
+                "Excitation laser not available: the Wasatch spectrometer-laser "
+                "unit was not found. Plug it in; it is retried automatically.")
 
     def _on_acquisition_toggled(self, checked: bool):
         """Handle acquisition start/stop."""
