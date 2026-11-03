@@ -102,9 +102,20 @@ QPushButton:pressed {
 - **Alternative spectrometer: Andor Kymera 328i + Newton DU920P CCD**
   - Driven through Andor's `pyAndorSDK2` (camera) + `pyAndorSpectrograph`
     (grating / wavelength drive); see `hardware/kymera_spectrometer.py`
-  - FVB single-scan readout, 1024 px, exposure set in seconds (GUI uses ms),
-    wavelength axis (nm) from the spectrograph calibration, lab defaults
-    grating 3 / centre 853 nm / CCD at -60 C
+  - Single-scan readout, 1024 px wide x 256 rows, exposure set in seconds
+    (GUI uses ms), wavelength axis (nm) from the spectrograph calibration,
+    lab defaults grating 3 / centre 853 nm / CCD at -60 C
+  - Spectrum readout = SINGLE TRACK over rows `KymeraConfig.bin_row_start..
+    bin_row_end` (default whole chip = FVB, the notebook's mode). The spectrum
+    panel has a Spectrum|Spectrograph slider switch (`gui/widgets/
+    toggle_switch.py`): Spectrograph mode reads the WHOLE sensor
+    (`SpectrumThread.image_ready`, no spectra taken, Wavelength/Crosshair/
+    Capture hidden or disabled, view auto-fitted to the frame) with draggable
+    row lines that only record the rows; Spectrum mode reads single-track
+    spectra. Never derive a spectrum by
+    summing image rows in software (per-pixel bias x N, ~20x higher baseline).
+    `acquire_frames` (autofocus/acquisition) always takes spectra. Rows apply
+    live via `set_bin_rows` / `apply_readout_config`, no reconnect
   - Has NO laser: the Wasatch unit still provides the 785 nm excitation and is
     then opened for laser control only (`hardware/wasatch_laser.py` on
     `gui/threads/laser_thread.py`)

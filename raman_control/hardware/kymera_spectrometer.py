@@ -14,6 +14,14 @@ wavelength drive). The sequence mirrors the lab's working notebook code
   exposure from another thread via ``CancelWait`` + ``AbortAcquisition``.
 * The wavelength axis is read from the spectrograph calibration ONCE after the
   grating / centre wavelength are set, not after every frame.
+* Readout geometry is configurable. The Newton is a 2D CCD (1024 x 256).
+  :meth:`acquire` returns the spectrum: the on-chip sum of the rows
+  ``KymeraConfig.bin_row_start..bin_row_end`` read in SINGLE TRACK mode
+  (the whole chip, the default, is read as FULL VERTICAL BINNING, the same
+  operation over all rows). :meth:`acquire_image` instead reads the whole
+  sensor in IMAGE mode and returns the (rows, pixels) frame for the GUI's
+  2D view; the two are never mixed in one exposure. Read-mode changes are
+  made between exposures (the SDK rejects them while acquiring).
 
 Units: the GUI works in milliseconds, the SDK in seconds. The spectrograph's
 calibration is in nanometres; Raman shift is derived with the excitation
@@ -53,6 +61,20 @@ DRV_IDLE = 20073
 DRV_NOT_INITIALIZED = 20075
 # ATSpectrograph return codes
 ATSPECTROGRAPH_SUCCESS = 20202
+# atmcd_codes.Read_Mode values (stable across SDK2 versions)
+READ_MODE_FVB = 0
+READ_MODE_SINGLE_TRACK = 3
+READ_MODE_IMAGE = 4
+
+
+def _to_counts(arr) -> np.ndarray:
+    """SDK ``*16`` readouts come back through a ``c_short`` buffer, so pixels
+    above 32767 wrap negative; reinterpret them as the unsigned 16-bit counts
+    they really are."""
+    a = np.asarray(arr)
+    if a.dtype == np.int16:
+        a = a.view(np.uint16)
+    return a.astype(np.float32)
 
 _DEFAULT_SDK_DIRS = (
     r"C:\Program Files\Andor SDK",
@@ -111,6 +133,13 @@ class KymeraSpectrometer(SpectrometerBackend):
         self._abort_requested = False
         self._grating = int(self._k.grating)
         self._center_nm = float(self._k.center_wavelength_nm)
+        # Readout geometry. The CCD is 2D (1024 x 256 on the Newton DU920P):
+        # the spectrum is the on-chip sum of rows _bin_start.._bin_end
+        # (1-based, inclusive) read as a single track (full range: FVB).
+        # acquire_image() reads the whole sensor instead.
+        self._bin_start = int(self._k.bin_row_start)
+        self._bin_end = int(self._k.bin_row_end)
+        self._applied_readout: Optional[tuple] = None  # (mode, start, end)
 
     # --- helpers --------------------------------------------------------------
 
@@ -214,14 +243,11 @@ class KymeraSpectrometer(SpectrometerBackend):
                 self._check(self._cam.CoolerON(), "CoolerON", fatal=False)
             self._poll_temperature(force=True)
 
-            # --- readout configuration: single scan, full vertical binning ---
+            # --- readout configuration: single scan, binned rows / image ---
             codes = self._codes
             if not self._check(self._cam.SetAcquisitionMode(
                     codes.Acquisition_Mode.SINGLE_SCAN), "SetAcquisitionMode"):
                 raise RuntimeError("SetAcquisitionMode failed")
-            if not self._check(self._cam.SetReadMode(
-                    codes.Read_Mode.FULL_VERTICAL_BINNING), "SetReadMode"):
-                raise RuntimeError("SetReadMode failed")
             if not self._check(self._cam.SetTriggerMode(
                     codes.Trigger_Mode.INTERNAL), "SetTriggerMode"):
                 raise RuntimeError("SetTriggerMode failed")
@@ -230,8 +256,9 @@ class KymeraSpectrometer(SpectrometerBackend):
                 raise RuntimeError("GetDetector failed")
             self._xpixels, self._ypixels = int(xpix), int(ypix)
             logger.info(f"Newton detector {self._xpixels} x {self._ypixels} px")
-            self._check(self._cam.SetImage(1, 1, 1, self._xpixels, 1, self._ypixels),
-                        "SetImage", fatal=False)
+            self._applied_readout = None
+            if not self._apply_readout(image=False):
+                raise RuntimeError("readout mode configuration failed")
             self._apply_exposure()
             self._check(self._cam.PrepareAcquisition(), "PrepareAcquisition",
                         fatal=False)
@@ -366,15 +393,115 @@ class KymeraSpectrometer(SpectrometerBackend):
             except Exception:  # noqa: BLE001
                 pass
 
-    def acquire(self) -> Optional[np.ndarray]:
+    # --- readout geometry (bin rows / 2D image) -------------------------------
+
+    @property
+    def supports_image_readout(self) -> bool:
+        return True
+
+    @property
+    def detector_rows(self) -> int:
+        return self._ypixels
+
+    def set_bin_rows(self, start: int, end: int) -> None:
+        """Rows (1-based, inclusive) summed into the spectrum; end 0 = last
+        row. Takes effect before the next exposure (SetReadMode / SetImage are
+        rejected while acquiring)."""
+        self._bin_start = int(start)
+        self._bin_end = int(end)
+        self._k.bin_row_start = self._bin_start
+        self._k.bin_row_end = self._bin_end
+
+    @property
+    def bin_rows(self) -> tuple:
+        return self._effective_rows()
+
+    def _effective_rows(self) -> tuple:
+        """Clamp the configured rows to the detector: (start, end), 1-based
+        inclusive, start <= end. Before connect the height is unknown and the
+        raw values are returned."""
+        y = self._ypixels
+        start, end = self._bin_start, self._bin_end
+        if y <= 0:
+            return (start, end)
+        if end <= 0 or end > y:
+            end = y
+        start = min(max(1, start), y)
+        if start > end:
+            start, end = end, start
+        return (start, end)
+
+    def _apply_readout(self, image: bool) -> bool:
+        """Push the read mode + image geometry to the SDK if they changed.
+        ``image`` selects the full-frame readout, otherwise the binned-rows
+        spectrum readout. Runs on the owner thread between exposures."""
         cam = self._cam
-        if cam is None or not self._connected:
+        if cam is None or self._ypixels <= 0:
+            return False
+        start, end = self._effective_rows()
+        x, y = self._xpixels, self._ypixels
+        if image:
+            wanted = ('image', 1, y)
+        elif (start, end) == (1, y):
+            wanted = ('fvb', 1, y)
+        else:
+            wanted = ('rows', start, end)
+        if wanted == self._applied_readout:
+            return True
+
+        mode = wanted[0]
+        if mode == 'fvb':
+            ok = self._check(cam.SetReadMode(READ_MODE_FVB), "SetReadMode(FVB)")
+            # Geometry is irrelevant in FVB but keep the SDK's image window
+            # consistent with the whole chip.
+            self._check(cam.SetImage(1, 1, 1, x, 1, y), "SetImage", fatal=False)
+        elif mode == 'rows':
+            # Single track: the chip sums only the rows of the track and
+            # returns ONE row of x pixels. The SDK describes the track by its
+            # centre row and height; for an even height the track is centred
+            # between two rows, so the covered rows can be off by one from
+            # (start, end) at one edge.
+            height = end - start + 1
+            centre = (start + end) // 2
+            ok = (self._check(cam.SetReadMode(READ_MODE_SINGLE_TRACK),
+                              "SetReadMode(SINGLE_TRACK)")
+                  and self._check(cam.SetSingleTrack(centre, height),
+                                  f"SetSingleTrack(centre {centre}, height {height})"))
+        else:
+            ok = (self._check(cam.SetReadMode(READ_MODE_IMAGE), "SetReadMode(IMAGE)")
+                  and self._check(cam.SetImage(1, 1, 1, x, 1, y), "SetImage(full)"))
+        if not ok:
+            return False
+        self._applied_readout = wanted
+        logger.info(f"Newton readout: {mode}, bin rows {start}-{end} of {y}")
+        return True
+
+    def acquire(self) -> Optional[np.ndarray]:
+        """One spectrum: the on-chip binned readout of the configured rows."""
+        if self._cam is None or not self._connected:
             return None
         self._abort_requested = False
         self._apply_exposure()
+        return self._expose(image=False)
+
+    def acquire_image(self) -> Optional[np.ndarray]:
+        """One full-sensor frame (rows, pixels) in IMAGE read mode."""
+        if self._cam is None or not self._connected:
+            return None
+        self._abort_requested = False
+        self._apply_exposure()
+        return self._expose(image=True)
+
+    def _expose(self, image: bool) -> Optional[np.ndarray]:
+        """Take one exposure in the requested readout and return the data:
+        (pixels,) for the spectrum readout, (rows, pixels) for the image."""
+        cam = self._cam
+        if cam is None or not self._apply_readout(image):
+            return None
         exposure_s = self._applied_exposure_s or self._exposure_s
         timeout_ms = int((exposure_s * 2.0 + float(self._k.acquisition_timeout_margin_s))
                          * 1000)
+        size = self._xpixels * self._ypixels if image else self._xpixels
 
         self._acquiring.set()
         try:
@@ -396,15 +523,17 @@ class KymeraSpectrometer(SpectrometerBackend):
                 except Exception:  # noqa: BLE001
                     pass
                 return None
-            ret, arr, _first, _last = cam.GetImages16(1, 1, self._xpixels)
+            ret, arr, _first, _last = cam.GetImages16(1, 1, size)
             if not self._check(ret, "GetImages16", fatal=False):
                 return None
-            spectrum = np.asarray(arr, dtype=np.float32).reshape(-1)[:self._xpixels]
-            if spectrum.size != self._xpixels:
-                logger.warning(f"Newton returned {spectrum.size} values, expected "
-                               f"{self._xpixels}")
+            data = _to_counts(arr).reshape(-1)[:size]
+            if data.size != size:
+                logger.warning(f"Newton returned {data.size} values, expected "
+                               f"{size}")
                 return None
-            return spectrum
+            if image:
+                return data.reshape(self._ypixels, self._xpixels)
+            return data
         except Exception as e:  # noqa: BLE001
             logger.error(f"Newton acquisition error: {e}")
             return None
@@ -458,9 +587,13 @@ class KymeraSpectrometer(SpectrometerBackend):
         return self._temp_code == DRV_TEMP_STABILIZED
 
     def status(self) -> SpectrometerStatus:
+        start, end = self._effective_rows()
         details = {
             "Grating": self._grating,
             "Center wavelength (nm)": f"{self._center_nm:.1f}",
+            "Bin rows": f"{start}-{end}",
+            "Spectrum readout": "FVB" if (start, end) == (1, self._ypixels)
+                                else "single track",
         }
         if self._spc_serial:
             details["Spectrograph serial"] = self._spc_serial

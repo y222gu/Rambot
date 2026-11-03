@@ -66,6 +66,10 @@ class SpectrumThread(QThread):
     """
 
     spectrum_ready = pyqtSignal(np.ndarray, np.ndarray, float)  # wavelengths, intensities, timestamp
+    # Full 2D detector frame (rows, pixels) + timestamp, emitted by the live
+    # loop instead of spectrum_ready while the image display is selected
+    # (Kymera/Newton, see set_image_mode).
+    image_ready = pyqtSignal(np.ndarray, float)
     connected = pyqtSignal()
     disconnected = pyqtSignal()
     error = pyqtSignal(str)
@@ -138,6 +142,10 @@ class SpectrumThread(QThread):
         # Simulated mode flag
         self._simulated = False
         self._last_status_emit = 0.0
+        # Live display mode for a 2D detector: False = binned spectrum,
+        # True = whole-sensor image (see set_image_mode).
+        self._image_mode = False
+        self._sim_rows = 256  # simulated 2D detector height
 
     # ------------------------------------------------------------------
     # Properties
@@ -189,6 +197,46 @@ class SpectrumThread(QThread):
             return self._laser_available
         return self._backend is not None and self._backend.has_laser \
             and self._backend.laser_available
+
+    @property
+    def supports_image_readout(self) -> bool:
+        """True when the connected detector is 2D and can show its frame
+        (Kymera/Newton; also True in simulation so the GUI can be tried)."""
+        if self._simulated:
+            return True
+        return self._backend is not None and self._backend.supports_image_readout
+
+    @property
+    def detector_rows(self) -> int:
+        """Rows of the 2D detector (0 for a 1D spectrometer)."""
+        if self._simulated:
+            return self._sim_rows
+        return self._backend.detector_rows if self._backend is not None else 0
+
+    @property
+    def image_mode(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._image_mode
+
+    @property
+    def bin_rows(self) -> tuple:
+        """Effective (start, end) rows binned into the spectrum, 1-based
+        inclusive, as the backend applies them."""
+        if self._simulated:
+            return self._clamp_rows(self._config.kymera.bin_row_start,
+                                    self._config.kymera.bin_row_end,
+                                    self._sim_rows)
+        return self._backend.bin_rows if self._backend is not None else (0, 0)
+
+    @staticmethod
+    def _clamp_rows(start: int, end: int, rows: int) -> tuple:
+        if rows <= 0:
+            return (int(start), int(end))
+        end = rows if end <= 0 or end > rows else int(end)
+        start = min(max(1, int(start)), rows)
+        if start > end:
+            start, end = end, start
+        return (start, end)
 
     @property
     def focus_metric(self) -> str:
@@ -276,28 +324,38 @@ class SpectrumThread(QThread):
                     if result is not None and len(result):
                         self._latest_spectrum = result.mean(
                             axis=0).astype(np.float32)
-                self._frames_done.set()
+                # Emit before releasing the waiting worker so the plotted
+                # spectrum / frame are already out when acquire_frames()
+                # returns.
                 if result is not None and len(result):
                     self.spectrum_ready.emit(
                         self._wavelengths, self._latest_spectrum, time.time())
+                self._frames_done.set()
                 continue
 
             with QMutexLocker(self._mutex):
                 live = self._acquiring and self._live_holds == 0
+                image_mode = self._image_mode
             if live:
                 acq_start = time.time()
 
-                # Acquire a single spectrum for display (no averaging).
-                spectrum = self._acquire_spectrum()
-                if spectrum is not None:
-                    spectrum = spectrum.astype(np.float32)
-                    with QMutexLocker(self._mutex):
-                        self._latest_spectrum = spectrum.copy()
-                    self.spectrum_ready.emit(
-                        self._wavelengths,
-                        spectrum,
-                        acq_start
-                    )
+                if image_mode:
+                    # Image display: read the whole sensor, no spectrum.
+                    frame = self._acquire_image()
+                    if frame is not None:
+                        self.image_ready.emit(np.asarray(frame), acq_start)
+                else:
+                    # Acquire a single spectrum for display (no averaging).
+                    spectrum = self._acquire_spectrum()
+                    if spectrum is not None:
+                        spectrum = spectrum.astype(np.float32)
+                        with QMutexLocker(self._mutex):
+                            self._latest_spectrum = spectrum.copy()
+                        self.spectrum_ready.emit(
+                            self._wavelengths,
+                            spectrum,
+                            acq_start
+                        )
 
                 # For simulated mode, sleep to simulate integration time
                 # For real hardware, acquire() already blocks for integration_time
@@ -377,6 +435,44 @@ class SpectrumThread(QThread):
             self._pending_settings['integration_time_ms'] = time_ms
         logger.info(f"Integration time set to {time_ms} ms")
 
+    def set_bin_rows(self, start: int, end: int):
+        """Rows (1-based, inclusive; end 0 = last) summed into the spectrum
+        on a 2D detector. Stored in the config and applied on the spectrum
+        thread before the next exposure."""
+        self._config.kymera.bin_row_start = int(start)
+        self._config.kymera.bin_row_end = int(end)
+        with QMutexLocker(self._mutex):
+            self._pending_settings['bin_rows'] = (int(start), int(end))
+        logger.info(f"Spectrum bin rows set to {start}-{end if end > 0 else 'last'}")
+
+    def apply_readout_config(self):
+        """Re-push the bin rows from the config (after the Settings dialog)."""
+        k = self._config.kymera
+        self.set_bin_rows(k.bin_row_start, k.bin_row_end)
+
+    def set_image_mode(self, on: bool):
+        """Select what the live loop reads from a 2D detector: the binned
+        spectrum (off, :attr:`spectrum_ready`) or the whole sensor as an image
+        (on, :attr:`image_ready`). The two are separate exposures and are
+        never mixed. On-demand :meth:`acquire_frames` (autofocus, acquisition)
+        always takes spectra, whatever is displayed."""
+        on = bool(on)
+        with QMutexLocker(self._mutex):
+            self._image_mode = on
+        logger.info(f"Spectrometer live readout: {'image' if on else 'spectrum'}")
+
+    def _acquire_image(self) -> Optional[np.ndarray]:
+        """One full-sensor frame (rows, pixels) on this (owner) thread."""
+        try:
+            if self._simulated:
+                return self._generate_simulated_frame()
+            if self._backend is None:
+                return None
+            return self._backend.acquire_image()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Detector image acquisition error: {e}")
+            return None
+
     def set_laser_power(self, power_percent: float):
         """Set laser power (0-100%)."""
         self._config.laser_power = max(0, min(100, power_percent))
@@ -426,6 +522,8 @@ class SpectrumThread(QThread):
         try:
             if 'integration_time_ms' in pending:
                 self._backend.set_integration_time_ms(pending['integration_time_ms'])
+            if 'bin_rows' in pending:
+                self._backend.set_bin_rows(*pending['bin_rows'])
             if self._use_laser_thread and self._laser_thread is not None:
                 # Laser settings queued before connect: forward them now.
                 if 'laser_power_mw' in pending:
@@ -689,5 +787,18 @@ class SpectrumThread(QThread):
         # Add time variation
         t = time.time()
         spectrum *= (1 + 0.05 * np.sin(t * 0.5))
-
         return np.maximum(spectrum, 0).astype(np.float32)
+
+    def _generate_simulated_frame(self) -> np.ndarray:
+        """Fake 2D sensor frame: the simulated spectrum spread over a
+        Gaussian stripe of rows around the chip centre (slightly tilted, as a
+        misaligned fibre would give), over a dark floor with noise."""
+        spectrum = self._generate_simulated_spectrum()
+        rows = self._sim_rows
+        r = np.arange(rows, dtype=np.float32)[:, None]
+        tilt = 4.0 * np.linspace(-1, 1, len(spectrum), dtype=np.float32)[None, :]
+        profile = np.exp(-((r - rows / 2 - tilt) ** 2) / (2 * 12.0 ** 2))
+        profile /= profile.sum(axis=0, keepdims=True)
+        frame = profile * spectrum[None, :]
+        frame += 100 + np.random.normal(0, 5, frame.shape)
+        return np.maximum(frame, 0).astype(np.float32)

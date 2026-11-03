@@ -119,6 +119,16 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
         "Keep cooler on at shutdown",
         "Keep the CCD at its set point when the camera is shut down instead "
         "of letting it warm uncontrolled"),
+    'bin_row_start': (
+        "Bin rows: first row",
+        "First CCD row (1-based, inclusive) summed into the spectrum. The "
+        "Newton DU920P has 256 rows. Use the Image toggle on the spectrum "
+        "plot to see where the signal lands. Applies live."),
+    'bin_row_end': (
+        "Bin rows: last row",
+        "Last CCD row (1-based, inclusive) summed into the spectrum. 0 = the "
+        "last row of the sensor (full vertical binning, the default). "
+        "Applies live."),
     'acquisition_timeout_margin_s': (
         "Acquisition timeout margin (s)",
         "One exposure is abandoned after 2 x exposure + this margin"),

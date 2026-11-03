@@ -19,6 +19,7 @@ import types
 
 import numpy as np
 import pytest
+from PyQt6.QtCore import Qt
 
 from raman_control.config.hardware_config import (
     HardwareConfig, KymeraConfig, SpectrometerConfig)
@@ -358,6 +359,9 @@ class FakeAtmcd:
     def SetImage(self, *a):
         return self._rec('SetImage', *a)
 
+    def SetSingleTrack(self, centre, height):
+        return self._rec('SetSingleTrack', centre, height)
+
     def SetExposureTime(self, s):
         self.exposure = s
         return self._rec('SetExposureTime', s)
@@ -687,3 +691,199 @@ def test_entropy_metric_prefers_peaked_spectrum():
         reference_band=(900, 910)) > 1.0
     # Empty band -> worst score, never a false "best".
     assert AutofocusEngine.calculate_entropy(wl, peaked, (1000, 1100)) == float('inf')
+
+
+# ---------------------------------------------------------------------------
+# Kymera readout geometry: bin rows + 2D image readout
+# ---------------------------------------------------------------------------
+
+def _calls_named(cam, name):
+    return [c for c in cam.calls if c[0] == name]
+
+
+def test_kymera_default_rows_use_fvb_and_whole_chip(fake_andor):
+    k = make_kymera()
+    assert k.connect()
+    cam = FakeAtmcd.instances[0]
+    assert k.supports_image_readout and k.detector_rows == 255
+    assert k.bin_rows == (1, 255)
+    assert ('SetReadMode', (0,)) in cam.calls
+    assert ('SetImage', (1, 1, 1, 1024, 1, 255)) in cam.calls
+    st = k.status()
+    assert st.details["Spectrum readout"] == "FVB"
+    assert st.details["Bin rows"] == "1-255"
+
+
+def test_kymera_partial_rows_read_as_single_track(fake_andor):
+    k = make_kymera(bin_row_start=100, bin_row_end=140)
+    assert k.connect()
+    cam = FakeAtmcd.instances[0]
+    assert k.bin_rows == (100, 140)
+    assert ('SetReadMode', (3,)) in cam.calls                    # SINGLE_TRACK
+    assert ('SetSingleTrack', (120, 41)) in cam.calls            # centre, height
+    spec = k.acquire()
+    assert spec is not None and spec.shape == (1024,)
+    # One row of x pixels is read.
+    assert _calls_named(cam, 'GetImages16')[-1][1] == (1, 1, 1024)
+    assert k.status().details["Spectrum readout"] == "single track"
+
+
+def test_kymera_set_bin_rows_applies_before_next_exposure(fake_andor):
+    k = make_kymera()
+    assert k.connect()
+    cam = FakeAtmcd.instances[0]
+    k.acquire()
+    n_mode = len(_calls_named(cam, 'SetReadMode'))
+    k.set_bin_rows(50, 60)
+    assert k.bin_rows == (50, 60)
+    assert len(_calls_named(cam, 'SetReadMode')) == n_mode  # deferred
+    k.acquire()
+    names = [c[0] for c in cam.calls]
+    i_start = len(names) - 1 - names[::-1].index('StartAcquisition')
+    i_mode = len(names) - 1 - names[::-1].index('SetReadMode')
+    assert i_mode < i_start
+    assert ('SetSingleTrack', (55, 11)) in cam.calls
+    # Unchanged rows -> not re-sent.
+    n_mode = len(_calls_named(cam, 'SetReadMode'))
+    k.acquire()
+    assert len(_calls_named(cam, 'SetReadMode')) == n_mode
+    # Back to the full range -> FVB again.
+    k.set_bin_rows(1, 0)
+    k.acquire()
+    assert _calls_named(cam, 'SetReadMode')[-1][1] == (0,)
+
+
+def test_kymera_rows_are_clamped_and_ordered(fake_andor):
+    k = make_kymera()
+    assert k.connect()
+    k.set_bin_rows(0, 0)
+    assert k.bin_rows == (1, 255)
+    k.set_bin_rows(300, 10)       # reversed + beyond the sensor
+    assert k.bin_rows == (10, 255)
+    k.set_bin_rows(200, 150)      # reversed
+    assert k.bin_rows == (150, 200)
+    k.set_bin_rows(-5, 3)
+    assert k.bin_rows == (1, 3)
+
+
+def test_kymera_acquire_image_reads_whole_sensor_then_spectrum_restores(fake_andor):
+    k = make_kymera(bin_row_start=10, bin_row_end=12)
+    assert k.connect()
+    cam = FakeAtmcd.instances[0]
+    frame = k.acquire_image()
+    assert ('SetReadMode', (4,)) in cam.calls                     # IMAGE
+    assert ('SetImage', (1, 1, 1, 1024, 1, 255)) in cam.calls
+    assert _calls_named(cam, 'GetImages16')[-1][1] == (1, 1, 1024 * 255)
+    assert frame is not None and frame.shape == (255, 1024)
+    assert frame.dtype == np.float32
+    assert frame[3, 7] == 3 * 1024 + 7     # fake returns arange(size)
+    # The next spectrum goes back to the single-track readout of the rows.
+    n_track = len(_calls_named(cam, 'SetSingleTrack'))
+    spec = k.acquire()
+    assert spec.shape == (1024,) and np.array_equal(spec, np.arange(1024))
+    assert _calls_named(cam, 'SetReadMode')[-1][1] == (3,)
+    assert len(_calls_named(cam, 'SetSingleTrack')) == n_track + 1
+    assert _calls_named(cam, 'SetSingleTrack')[-1][1] == (11, 3)
+    assert _calls_named(cam, 'GetImages16')[-1][1] == (1, 1, 1024)
+
+
+def test_kymera_acquire_image_timeout_returns_none(fake_andor):
+    FakeAtmcd.wait_ret = DRV_NO_NEW_DATA
+    k = make_kymera()
+    assert k.connect()
+    assert k.acquire_image() is None
+    assert ('AbortAcquisition', ()) in FakeAtmcd.instances[0].calls
+
+
+def test_to_counts_unwraps_signed_16bit_readout():
+    from raman_control.hardware.kymera_spectrometer import _to_counts
+    raw = np.array([0, 100, -1, -32768], dtype=np.int16)  # c_short buffer
+    out = _to_counts(raw)
+    assert out.dtype == np.float32
+    assert out.tolist() == [0.0, 100.0, 65535.0, 32768.0]
+
+
+class FakeImageBackend(FakeBackend):
+    """FakeBackend with a 2D detector (rows x pixels)."""
+
+    def __init__(self, name, rows=8, **kw):
+        super().__init__(name, **kw)
+        self.rows = rows
+        self._bin = (1, rows)
+        self.images = 0
+
+    @property
+    def supports_image_readout(self):
+        return True
+
+    @property
+    def detector_rows(self):
+        return self.rows
+
+    def set_bin_rows(self, start, end):
+        end = self.rows if end <= 0 else end
+        self._bin = (start, end)
+
+    @property
+    def bin_rows(self):
+        return self._bin
+
+    def acquire_image(self):
+        self.images += 1
+        return np.tile(np.arange(self._pixels, dtype=np.float32), (self.rows, 1))
+
+
+def test_thread_image_mode_reads_frames_instead_of_spectra(monkeypatch):
+    spec = SpectrumThread(SpectrometerConfig(backend='kymera', integration_time=1))
+    backend = FakeImageBackend('kymera', rows=8, pixels=16)
+    patch_candidates(monkeypatch, spec, [backend])
+    frames, spectra = [], []
+    # Direct connections: the emitting thread has no Qt event loop here.
+    spec.image_ready.connect(lambda f, ts: frames.append(f),
+                             Qt.ConnectionType.DirectConnection)
+    spec.spectrum_ready.connect(lambda w, i, ts: spectra.append(i),
+                                Qt.ConnectionType.DirectConnection)
+    t = run_thread(spec)
+    try:
+        assert spec.supports_image_readout and spec.detector_rows == 8
+        spec.set_bin_rows(2, 3)
+        spec.set_image_mode(True)
+        spec.start_acquisition()
+        deadline = time.time() + 2.0
+        while len(frames) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(frames) >= 2 and frames[0].shape == (8, 16)
+        assert backend.images >= 2
+        # Rows were recorded on the backend but the live loop took no spectra.
+        assert backend.bin_rows == (2, 3) and spec.bin_rows == (2, 3)
+        assert spectra == [] and backend.acquired == 0
+        # On-demand frames (autofocus / acquisition) still take real spectra.
+        out = spec.acquire_frames(2, timeout=2.0)
+        assert out is not None and out.shape == (2, 16)
+        assert backend.acquired == 2 and len(spectra) == 1
+        # Back to spectrum display: spectra flow, frames stop.
+        spec.set_image_mode(False)
+        n_frames, n_images = len(frames), backend.images
+        deadline = time.time() + 2.0
+        while len(spectra) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(spectra) >= 3
+        assert backend.images in (n_images, n_images + 1)  # at most one in flight
+        assert len(frames) in (n_frames, n_frames + 1)
+    finally:
+        stop_thread(spec, t)
+
+
+def test_hardware_config_round_trips_bin_rows(tmp_path):
+    cfg = HardwareConfig()
+    assert cfg.spectrometer.kymera.bin_row_start == 1
+    assert cfg.spectrometer.kymera.bin_row_end == 0
+    cfg.spectrometer.kymera.bin_row_start = 90
+    cfg.spectrometer.kymera.bin_row_end = 160
+    path = tmp_path / "hw.json"
+    cfg.save_to_file(str(path))
+    loaded = HardwareConfig.load_from_file(str(path))
+    assert loaded.spectrometer.kymera.bin_row_start == 90
+    assert loaded.spectrometer.kymera.bin_row_end == 160
+    loaded.update_from_dict({'spectrometer.kymera.bin_row_end': 0})
+    assert loaded.spectrometer.kymera.bin_row_end == 0

@@ -127,6 +127,35 @@ class SpectrometerBackend(ABC):
         CCD exposures) need it. Default: no-op.
         """
 
+    # --- 2D detectors (optional) ------------------------------------------
+
+    @property
+    def supports_image_readout(self) -> bool:
+        """True if the detector is a 2D sensor that can return the full frame
+        (the Newton CCD behind the Kymera). Default: False."""
+        return False
+
+    @property
+    def detector_rows(self) -> int:
+        """Rows of the 2D sensor (0 for a 1D detector)."""
+        return 0
+
+    def set_bin_rows(self, start: int, end: int) -> None:
+        """Rows (1-based, inclusive) summed into the spectrum. ``end`` 0 =
+        last row. Default: ignored (1D detectors)."""
+
+    @property
+    def bin_rows(self) -> tuple:
+        """The effective (start, end) rows after clamping, or (0, 0)."""
+        return (0, 0)
+
+    def acquire_image(self) -> Optional[np.ndarray]:
+        """Take ONE fresh exposure reading the whole 2D sensor and return it
+        as a (rows, pixels) float32 frame, or None. Only for backends with
+        :attr:`supports_image_readout`; default: None. The next
+        :meth:`acquire` switches back to the spectrum readout by itself."""
+        return None
+
     def status(self) -> SpectrometerStatus:
         """Current status snapshot (default: static identity only)."""
         return SpectrometerStatus(model=self.model, pixels=self.pixels)

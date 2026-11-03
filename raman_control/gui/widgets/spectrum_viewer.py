@@ -16,7 +16,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QSlider, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QComboBox, QSizePolicy, QFileDialog
+    QCheckBox, QComboBox, QSizePolicy, QFileDialog, QStackedWidget
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QPoint, QSize, QEvent
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPolygon
@@ -24,6 +24,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QBrush, QPolygon
 import pyqtgraph as pg
 
 from raman_control.gui.threads.spectrum_thread import SpectrumThread
+from raman_control.gui.widgets.toggle_switch import ToggleSwitch
 from raman_control.gui.styles import COLORS
 from raman_control.config.hardware_config import SpectrometerConfig
 from raman_control.config.logging_config import get_logger
@@ -95,6 +96,13 @@ class SpectrumViewerWidget(QWidget):
         self._last_plot_update = 0.0
         self._min_plot_interval = 0.033  # ~30 fps max
 
+        # 2D detector image display (Kymera/Newton): latest frame and its own
+        # rate limit. _updating_rows guards against feedback between the row
+        # spin boxes and the draggable row lines.
+        self._current_frame: Optional[np.ndarray] = None
+        self._last_image_update = 0.0
+        self._updating_rows = False
+
         # Build UI
         self._setup_ui()
 
@@ -116,9 +124,17 @@ class SpectrumViewerWidget(QWidget):
         main_layout.setContentsMargins(8, 0, 8, 0)
         main_layout.setSpacing(8)
 
-        # === Plot Area ===
+        # === Display Area ===
+        # Two display modes, one shown at a time: the spectrum plot, or the
+        # 2D detector image (Kymera/Newton only). The Spectrum/Image toggle
+        # lives in the overlay floating over whichever page is shown.
         self._setup_plot()
-        main_layout.addWidget(self._plot_widget, 1)
+        self._setup_image_panel()
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(self._plot_widget)   # page 0: spectrum
+        self._view_stack.addWidget(self._image_panel)   # page 1: image
+        main_layout.addWidget(self._view_stack, 1)
+        self._create_plot_overlay()
 
         # === Controls (no surrounding frame) ===
         controls_frame = QWidget()
@@ -412,12 +428,11 @@ class SpectrumViewerWidget(QWidget):
             font-size: 11px;
         ''')
 
-        # Display toggles floating at the plot's top-right corner.
-        self._create_plot_overlay()
-
     def _create_plot_overlay(self):
-        """Show Peaks / Crosshair / Auto Scale floating at the plot top-right."""
-        vp = self._plot_widget.viewport()
+        """Wavelength / Crosshair toggles and the Spectrum|Image display
+        toggle, floating at the top-right of the display area (over whichever
+        page the stack shows)."""
+        vp = self._view_stack
 
         self._plot_overlay = QWidget(vp)
         self._plot_overlay.setObjectName('plotOverlay')
@@ -442,19 +457,47 @@ class SpectrumViewerWidget(QWidget):
         self._crosshair_check.toggled.connect(self._on_crosshair_toggled)
         ov.addWidget(self._crosshair_check)
 
-        self._autoscale_btn = QPushButton("Auto Scale")
-        self._autoscale_btn.clicked.connect(self._on_autoscale)
-        ov.addWidget(self._autoscale_btn)
+        # Display mode switch, only shown for a 2D detector (Kymera/Newton):
+        # Spectrum (off) = the live loop reads the binned spectrum;
+        # Spectrograph (on) = it reads the whole sensor and shows the image
+        # (separate exposures, never mixed). Drawn as a sliding switch with
+        # the two mode names on either side, the active one highlighted.
+        self._mode_box = QWidget()
+        mode_lay = QHBoxLayout(self._mode_box)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lay.setSpacing(6)
+        self._mode_spectrum_label = QLabel("Spectrum")
+        self._mode_spectrograph_label = QLabel("Spectrograph")
+        self._image_btn = ToggleSwitch()
+        self._image_btn.setToolTip(
+            "Switch the display between the binned spectrum and the raw 2D "
+            "spectrograph image (Andor Newton only). In Spectrograph mode the "
+            "whole sensor is read and no spectrum is taken; drag the two lines "
+            "or edit the row boxes to set the rows the spectrum readout bins.")
+        self._image_btn.toggled.connect(self._on_image_toggled)
+        mode_lay.addWidget(self._mode_spectrum_label)
+        mode_lay.addWidget(self._image_btn)
+        mode_lay.addWidget(self._mode_spectrograph_label)
+        self._style_mode_labels(False)
+        self._mode_box.hide()
+        ov.addWidget(self._mode_box)
 
-        # Reposition the overlays whenever the plot is resized/shown.
+        # Reposition the overlay whenever the display area is resized/shown.
         vp.installEventFilter(self)
         self._reposition_plot_overlay()
 
+    def _style_mode_labels(self, image_on: bool):
+        """Highlight the active mode name next to the switch."""
+        on = f"color: {COLORS['accent_primary']}; font-weight: 600;"
+        off = f"color: {COLORS['text_secondary']};"
+        self._mode_spectrum_label.setStyleSheet(off if image_on else on)
+        self._mode_spectrograph_label.setStyleSheet(on if image_on else off)
+
     def _reposition_plot_overlay(self):
-        """Anchor the Crosshair / Auto Scale overlay to the plot's top-right."""
+        """Anchor the overlay to the display area's top-right."""
         if not hasattr(self, '_plot_overlay'):
             return
-        vp = self._plot_widget.viewport()
+        vp = self._view_stack
         margin = 8
         self._plot_overlay.adjustSize()
         self._plot_overlay.move(
@@ -464,10 +507,267 @@ class SpectrumViewerWidget(QWidget):
         self._plot_overlay.raise_()
 
     def eventFilter(self, obj, event):
-        if (obj is self._plot_widget.viewport()
+        if (obj is getattr(self, '_view_stack', None)
                 and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)):
             self._reposition_plot_overlay()
         return super().eventFilter(obj, event)
+
+    # --- 2D detector image panel ---------------------------------------------
+
+    def _setup_image_panel(self):
+        """Build the (initially hidden) detector-image panel: an image plot
+        with pixel axes, two draggable row lines marking the binned rows,
+        and a header with the row spin boxes and an auto-levels toggle."""
+        self._image_panel = QWidget()
+        lay = QVBoxLayout(self._image_panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 0, 4, 0)
+        header.setSpacing(8)
+        title = QLabel("Spectrograph image")
+        title.setStyleSheet(f"color: {COLORS['text_secondary']}; font-weight: 600;")
+        header.addWidget(title)
+        header.addSpacing(12)
+        header.addWidget(QLabel("Bin rows"))
+        self._row_start_spin = QSpinBox()
+        self._row_end_spin = QSpinBox()
+        for sp in (self._row_start_spin, self._row_end_spin):
+            sp.setRange(1, 1)
+            sp.setFixedWidth(64)
+            sp.setKeyboardTracking(False)
+            sp.setToolTip("CCD rows (1-based, inclusive) the spectrum readout "
+                          "bins (single track). Recorded here; used by the "
+                          "next spectrum readout. Same setting as Settings > "
+                          "Spectrometer.")
+        self._row_start_spin.valueChanged.connect(self._on_row_spin_changed)
+        self._row_end_spin.valueChanged.connect(self._on_row_spin_changed)
+        header.addWidget(self._row_start_spin)
+        header.addWidget(QLabel("to"))
+        header.addWidget(self._row_end_spin)
+        self._rows_all_btn = QPushButton("All rows")
+        self._rows_all_btn.setToolTip("Bin the whole sensor (full vertical binning)")
+        self._rows_all_btn.clicked.connect(self._on_rows_all_clicked)
+        header.addWidget(self._rows_all_btn)
+        header.addSpacing(12)
+        self._auto_levels_check = QCheckBox("Auto levels")
+        self._auto_levels_check.setChecked(True)
+        self._auto_levels_check.setToolTip(
+            "Rescale the grey levels to each frame (1st-99.5th percentile)")
+        header.addWidget(self._auto_levels_check)
+        header.addStretch()
+        lay.addLayout(header)
+
+        self._image_widget = pg.PlotWidget()
+        self._image_widget.setBackground(COLORS['bg_light'])
+        self._image_widget.setMinimumHeight(140)
+        axis_pen = pg.mkPen(color=COLORS['border_light'], width=1)
+        for axis in ('bottom', 'left'):
+            ax = self._image_widget.getAxis(axis)
+            ax.setPen(axis_pen)
+            ax.setTextPen(pg.mkPen(COLORS['text_secondary']))
+            ax.autoSIPrefix = False
+        self._image_widget.setLabel('bottom', 'Pixel column', **self._axis_label_style)
+        self._image_widget.setLabel('left', 'Row', **self._axis_label_style)
+        vb = self._image_widget.plotItem.vb
+        vb.setAspectLocked(False)
+        vb.invertY(True)  # row 1 at the top, like the camera's own numbering
+        vb.setMenuEnabled(False)
+
+        # Image item in row-major order: frame[row, column] maps to (x=col, y=row).
+        self._image_item = pg.ImageItem(axisOrder='row-major')
+        self._image_widget.addItem(self._image_item)
+
+        # Draggable boundaries of the binned rows. Row r (1-based) spans
+        # y in [r-1, r), so the start line sits at start-1 and the end line
+        # at end.
+        pen = pg.mkPen(COLORS['warning'], width=2)
+        hover = pg.mkPen(COLORS['accent_primary'], width=2)
+        self._row_start_line = pg.InfiniteLine(angle=0, movable=True, pen=pen,
+                                               hoverPen=hover)
+        self._row_end_line = pg.InfiniteLine(angle=0, movable=True, pen=pen,
+                                             hoverPen=hover)
+        for line in (self._row_start_line, self._row_end_line):
+            self._image_widget.addItem(line, ignoreBounds=True)
+            line.sigDragged.connect(self._on_row_line_dragged)
+            line.sigPositionChangeFinished.connect(self._on_row_line_released)
+        self._image_widget.scene().sigMouseMoved.connect(self._on_image_mouse_moved)
+
+        # Row / column / counts readout drawn in the image's top-LEFT corner
+        # (orange, like the spectrum crosshair readout), away from the mode
+        # switch overlay at the top-right. Re-pinned on every range change.
+        self._image_readout = pg.TextItem(text="", color=(255, 165, 0),
+                                          anchor=(0, 0))
+        self._image_readout.setZValue(100)
+        self._image_widget.addItem(self._image_readout, ignoreBounds=True)
+        self._image_readout.hide()
+        vb.sigRangeChanged.connect(self._position_image_readout)
+        lay.addWidget(self._image_widget, 1)
+
+    def _detector_rows(self) -> int:
+        if self._spectrum_thread is None:
+            return 0
+        return int(getattr(self._spectrum_thread, 'detector_rows', 0) or 0)
+
+    def _effective_rows(self) -> Tuple[int, int]:
+        """Configured bin rows clamped to the detector (1-based, inclusive)."""
+        rows = self._detector_rows()
+        k = self._config.kymera
+        start, end = int(k.bin_row_start), int(k.bin_row_end)
+        if rows <= 0:
+            return (max(1, start), max(start, end) if end > 0 else max(1, start))
+        end = rows if end <= 0 or end > rows else end
+        start = min(max(1, start), rows)
+        if start > end:
+            start, end = end, start
+        return (start, end)
+
+    def refresh_bin_rows(self):
+        """Sync the row spin boxes and lines from the config (called after the
+        Settings dialog and on connect)."""
+        rows = self._detector_rows()
+        start, end = self._effective_rows()
+        self._updating_rows = True
+        try:
+            hi = max(1, rows)
+            self._row_start_spin.setRange(1, hi)
+            self._row_end_spin.setRange(1, hi)
+            self._row_start_spin.setValue(start)
+            self._row_end_spin.setValue(end)
+            self._row_start_line.setBounds((0, hi))
+            self._row_end_line.setBounds((0, hi))
+            self._row_start_line.setPos(start - 1)
+            self._row_end_line.setPos(end)
+        finally:
+            self._updating_rows = False
+
+    def _apply_rows(self, start: int, end: int):
+        """Push a new row range to the config + spectrum thread."""
+        rows = self._detector_rows()
+        if rows > 0:
+            start = min(max(1, int(start)), rows)
+            end = min(max(1, int(end)), rows)
+        if start > end:
+            start, end = end, start
+        self._config.kymera.bin_row_start = start
+        self._config.kymera.bin_row_end = end
+        if self._spectrum_thread is not None and hasattr(self._spectrum_thread,
+                                                         'set_bin_rows'):
+            self._spectrum_thread.set_bin_rows(start, end)
+        self.refresh_bin_rows()
+
+    def _on_row_spin_changed(self, _value: int):
+        if self._updating_rows:
+            return
+        self._apply_rows(self._row_start_spin.value(), self._row_end_spin.value())
+
+    def _on_rows_all_clicked(self):
+        rows = self._detector_rows()
+        self._apply_rows(1, rows if rows > 0 else 1)
+
+    def _on_row_line_dragged(self, _line):
+        """Live feedback while a row line is dragged: update the spin boxes
+        only (the hardware gets the new rows on release)."""
+        if self._updating_rows:
+            return
+        start, end = self._rows_from_lines()
+        self._updating_rows = True
+        try:
+            self._row_start_spin.setValue(start)
+            self._row_end_spin.setValue(end)
+        finally:
+            self._updating_rows = False
+
+    def _on_row_line_released(self, _line):
+        if self._updating_rows:
+            return
+        start, end = self._rows_from_lines()
+        self._apply_rows(start, end)
+
+    def _rows_from_lines(self) -> Tuple[int, int]:
+        rows = max(1, self._detector_rows())
+        a = int(round(self._row_start_line.value()))
+        b = int(round(self._row_end_line.value()))
+        lo, hi = (a, b) if a <= b else (b, a)
+        start = min(max(1, lo + 1), rows)
+        end = min(max(start, hi), rows)
+        return (start, end)
+
+    def _on_image_toggled(self, checked: bool):
+        """Switch the display (and the live readout) between the spectrum
+        and the spectrograph image."""
+        self._view_stack.setCurrentIndex(1 if checked else 0)
+        self._style_mode_labels(checked)
+        # Spectrum-only overlay controls.
+        self._xunit_check.setVisible(not checked)
+        self._crosshair_check.setVisible(not checked)
+        self._reposition_plot_overlay()
+        if checked:
+            self.refresh_bin_rows()
+            self._image_readout.hide()
+            # Show the whole sensor; the first frame re-fits once its size is
+            # known (see _on_image_ready).
+            self._image_autorange_pending = True
+            self._image_widget.plotItem.vb.autoRange()
+        else:
+            self._current_frame = None
+        # Capture collects spectra, which are not taken in image mode.
+        if self._capturing and checked:
+            self._finish_capture(save=False)
+        connected = bool(self._spectrum_thread and self._spectrum_thread.is_connected)
+        self._capture_btn.setEnabled(connected and not checked)
+        if self._spectrum_thread is not None and hasattr(self._spectrum_thread,
+                                                         'set_image_mode'):
+            self._spectrum_thread.set_image_mode(checked)
+
+    def _on_image_ready(self, frame: np.ndarray, timestamp: float):
+        """Display a new detector frame (rate limited like the spectrum)."""
+        import time
+        self._current_frame = frame
+        now = time.time()
+        if now - self._last_image_update < self._min_plot_interval:
+            return
+        self._last_image_update = now
+        if self._auto_levels_check.isChecked():
+            lo, hi = np.percentile(frame, (1.0, 99.5))
+            if hi <= lo:
+                hi = lo + 1.0
+            self._image_item.setImage(frame, autoLevels=False, levels=(lo, hi))
+        else:
+            self._image_item.setImage(frame, autoLevels=False)
+        if self._row_start_spin.maximum() != frame.shape[0]:
+            self.refresh_bin_rows()
+        if getattr(self, '_image_autorange_pending', True):
+            # First frame after entering Spectrograph mode: fit the full
+            # image (rows x columns) into the view.
+            self._image_autorange_pending = False
+            vb = self._image_widget.plotItem.vb
+            vb.setRange(xRange=(0, frame.shape[1]), yRange=(0, frame.shape[0]),
+                        padding=0.0)
+
+    def _position_image_readout(self, *args):
+        """Pin the readout to the top-left corner of the current view (the
+        y axis is inverted, so the top is the smaller y)."""
+        (xmin, _xmax), (ymin, _ymax) = self._image_widget.plotItem.vb.viewRange()
+        self._image_readout.setPos(xmin, ymin)
+
+    def _on_image_mouse_moved(self, pos):
+        """Row / column / counts readout under the cursor."""
+        frame = self._current_frame
+        if frame is None or not self._image_widget.sceneBoundingRect().contains(pos):
+            return
+        try:
+            p = self._image_widget.plotItem.vb.mapSceneToView(pos)
+        except RuntimeError:
+            return
+        col, row = int(p.x()), int(p.y())
+        if 0 <= row < frame.shape[0] and 0 <= col < frame.shape[1]:
+            self._image_readout.setText(
+                f"Row = {row + 1}\nColumn = {col + 1}\n"
+                f"Counts = {float(frame[row, col]):.0f}")
+            self._image_readout.show()
+            self._position_image_readout()
 
     def _create_controls_grid(self) -> QWidget:
         """Acquisition + laser controls.
@@ -660,6 +960,8 @@ class SpectrumViewerWidget(QWidget):
     def _connect_signals(self):
         """Connect spectrum thread signals."""
         self._spectrum_thread.spectrum_ready.connect(self._on_spectrum_ready)
+        if hasattr(self._spectrum_thread, 'image_ready'):
+            self._spectrum_thread.image_ready.connect(self._on_image_ready)
         self._spectrum_thread.connected.connect(self._on_connected)
         self._spectrum_thread.disconnected.connect(self._on_disconnected)
         self._spectrum_thread.laser_state_changed.connect(self._on_laser_state_changed)
@@ -740,10 +1042,20 @@ class SpectrumViewerWidget(QWidget):
         # The laser button follows the laser hardware, which may be a separate
         # unit from the spectrometer (Kymera spectra + Wasatch laser).
         self._on_laser_available_changed(self._spectrum_thread.laser_available)
-        self._capture_btn.setEnabled(True)
+        self._capture_btn.setEnabled(not self._image_btn.isChecked())
         label = getattr(self._spectrum_thread, 'backend_label', '')
         if label:
             self._af_panel.setTitle(f"Spectrometer Autofocus ({label})")
+        # The Image display only exists for a 2D detector (Newton CCD).
+        is_2d = bool(getattr(self._spectrum_thread, 'supports_image_readout', False))
+        self._mode_box.setVisible(is_2d)
+        if is_2d:
+            self.refresh_bin_rows()
+            if self._image_btn.isChecked():
+                self._spectrum_thread.set_image_mode(True)
+        elif self._image_btn.isChecked():
+            self._image_btn.setChecked(False)  # 1D device: spectrum display
+        self._reposition_plot_overlay()
         # Auto-start acquisition on connect and reflect it on the play button
         # (checked + pause icon / filled style).
         if self._spectrum_thread:
@@ -763,6 +1075,9 @@ class SpectrumViewerWidget(QWidget):
         self._laser_btn.setEnabled(False)
         self._capture_btn.setEnabled(False)
         self._af_panel.setTitle("Spectrometer Autofocus")
+        self._mode_box.hide()
+        self._current_frame = None
+        self._reposition_plot_overlay()
         logger.info("Spectrometer disconnected")
 
     def _on_laser_state_changed(self, is_on: bool):
@@ -931,6 +1246,10 @@ class SpectrumViewerWidget(QWidget):
                 meta.update(self._metadata_provider() or {})
             except Exception as e:  # noqa: BLE001 - never block saving
                 logger.error(f"Capture metadata provider failed: {e}")
+        if self._spectrum_thread is not None and getattr(
+                self._spectrum_thread, 'supports_image_readout', False):
+            start, end = self._effective_rows()
+            meta["bin_rows"] = f"{start}-{end}"
         meta["spectra_file"] = os.path.basename(spectra_path)
 
         meta_path = os.path.splitext(spectra_path)[0] + "_metadata.txt"
@@ -965,10 +1284,6 @@ class SpectrumViewerWidget(QWidget):
                 except TypeError:
                     pass  # Already disconnected
                 self._mouse_tracking_enabled = False
-
-    def _on_autoscale(self):
-        """Auto-scale the plot to fit data."""
-        self._plot_widget.enableAutoRange()
 
     def _on_mouse_moved(self, pos):
         """Move the crosshair to the cursor's wavenumber/wavelength."""

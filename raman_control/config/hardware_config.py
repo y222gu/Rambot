@@ -155,6 +155,14 @@ class KymeraConfig:
     # Keep the set point when the camera is shut down (Andor cooler mode 1),
     # so a disconnect never leaves the sensor warming uncontrolled.
     keep_cooler_on_shutdown: bool = True
+    # Rows of the CCD that are summed (binned) into the spectrum, 1-based and
+    # inclusive like Andor's own row numbering. End 0 = the last row, so the
+    # defaults bin the whole chip (full vertical binning, the lab default).
+    # Narrowing the range excludes rows that carry only dark signal or stray
+    # light; the 2D image view in the spectrum panel shows where the signal
+    # lands. Applied live, no reconnect needed.
+    bin_row_start: int = 1
+    bin_row_end: int = 0
     # Extra time allowed for one exposure beyond 2x the exposure itself before
     # it is declared hung and aborted (readout + transfer margin).
     acquisition_timeout_margin_s: float = 5.0

@@ -1535,13 +1535,11 @@ class MainWindow(QMainWindow):
         pnl = self._protocol_panel
         # The panel owns Start/Pause/Stop via on_acquisition_started/finished.
         # The laser on/off button stays usable during a run (safety: the user
-        # must always be able to kill the laser). The spectrum plot's Auto Scale
-        # stays usable too, so the live spectrum can be rescaled mid-run.
+        # must always be able to kill the laser).
         owned = {getattr(pnl, '_start_btn', None),
                  getattr(pnl, '_pause_btn', None),
                  getattr(pnl, '_stop_btn', None),
-                 getattr(self._spectrum_viewer, '_laser_btn', None),
-                 getattr(self._spectrum_viewer, '_autoscale_btn', None)}
+                 getattr(self._spectrum_viewer, '_laser_btn', None)}
         owned |= set(keep)
 
         from PyQt6.QtCore import Qt
@@ -1845,6 +1843,10 @@ class MainWindow(QMainWindow):
             # live view's scale bar and proximity marker, which derive their
             # size from the pixel calibration.
             self._live_view.refresh_calibration()
+            # Kymera bin rows apply live (queued to the spectrum thread); the
+            # spectrum panel's row boxes / image lines follow the config.
+            self._spectrometer.apply_readout_config()
+            self._spectrum_viewer.refresh_bin_rows()
 
     def _show_about(self):
         QMessageBox.about(
