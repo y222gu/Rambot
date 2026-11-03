@@ -416,6 +416,22 @@ class SpectrumViewerWidget(QWidget):
         self._plot_widget.plotItem.vb.sigRangeChanged.connect(
             self._position_crosshair_text)
 
+        # Placeholder drawn in the middle of the (empty) plot while no
+        # spectrometer is connected: at start-up, after Disconnect, and when
+        # the spectrometer selected in Settings is not found. Spectra are only
+        # ever shown from the configured spectrometer.
+        self._placeholder = pg.TextItem(text="Spectrometer not connected",
+                                        color=COLORS['text_secondary'],
+                                        anchor=(0.5, 0.5))
+        self._placeholder.setZValue(101)
+        ph_font = self._placeholder.textItem.font()
+        ph_font.setPointSize(14)
+        self._placeholder.setFont(ph_font)
+        self._plot_widget.addItem(self._placeholder, ignoreBounds=True)
+        self._plot_widget.plotItem.vb.sigRangeChanged.connect(
+            self._position_placeholder)
+        self._position_placeholder()
+
         # Mouse tracking - DISABLED by default for performance
         # Only enabled when crosshair checkbox is checked
         self._mouse_tracking_enabled = False
@@ -471,9 +487,11 @@ class SpectrumViewerWidget(QWidget):
         self._image_btn = ToggleSwitch()
         self._image_btn.setToolTip(
             "Switch the display between the binned spectrum and the raw 2D "
-            "spectrograph image (Andor Newton only). In Spectrograph mode the "
-            "whole sensor is read and no spectrum is taken; drag the two lines "
-            "or edit the row boxes to set the rows the spectrum readout bins.")
+            "spectrograph image (2D detectors: Andor Newton, or a Wasatch unit "
+            "whose firmware supports area scan). In Spectrograph mode the "
+            "whole sensor is read and no spectrum is taken; the two lines mark "
+            "the rows the spectrum readout bins (drag them or edit the row "
+            "boxes where the hardware allows changing them).")
         self._image_btn.toggled.connect(self._on_image_toggled)
         mode_lay.addWidget(self._mode_spectrum_label)
         mode_lay.addWidget(self._image_btn)
@@ -537,10 +555,11 @@ class SpectrumViewerWidget(QWidget):
             sp.setRange(1, 1)
             sp.setFixedWidth(64)
             sp.setKeyboardTracking(False)
-            sp.setToolTip("CCD rows (1-based, inclusive) the spectrum readout "
-                          "bins (single track). Recorded here; used by the "
-                          "next spectrum readout. Same setting as Settings > "
-                          "Spectrometer.")
+            sp.setToolTip("Detector rows (1-based, inclusive) the spectrum "
+                          "readout bins. Recorded here; used by the next "
+                          "spectrum readout. Same setting as Settings > "
+                          "Spectrometer. Greyed out when the spectrometer's "
+                          "firmware fixes the rows.")
         self._row_start_spin.valueChanged.connect(self._on_row_spin_changed)
         self._row_end_spin.valueChanged.connect(self._on_row_spin_changed)
         header.addWidget(self._row_start_spin)
@@ -550,6 +569,14 @@ class SpectrumViewerWidget(QWidget):
         self._rows_all_btn.setToolTip("Bin the whole sensor (full vertical binning)")
         self._rows_all_btn.clicked.connect(self._on_rows_all_clicked)
         header.addWidget(self._rows_all_btn)
+        self._rows_fixed_label = QLabel("fixed by firmware")
+        self._rows_fixed_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self._rows_fixed_label.setToolTip(
+            "This spectrometer's firmware does not allow changing the rows it "
+            "bins into the spectrum (Wasatch vertical ROI). The lines show the "
+            "factory rows.")
+        self._rows_fixed_label.hide()
+        header.addWidget(self._rows_fixed_label)
         header.addSpacing(12)
         self._auto_levels_check = QCheckBox("Auto levels")
         self._auto_levels_check.setChecked(True)
@@ -611,10 +638,17 @@ class SpectrumViewerWidget(QWidget):
         return int(getattr(self._spectrum_thread, 'detector_rows', 0) or 0)
 
     def _effective_rows(self) -> Tuple[int, int]:
-        """Configured bin rows clamped to the detector (1-based, inclusive)."""
+        """Bin rows as the connected spectrometer applies them (1-based,
+        inclusive), from the spectrum thread; before connect, the configured
+        rows clamped to the detector."""
         rows = self._detector_rows()
-        k = self._config.kymera
-        start, end = int(k.bin_row_start), int(k.bin_row_end)
+        if self._spectrum_thread is not None and self._spectrum_thread.is_connected:
+            start, end = self._spectrum_thread.bin_rows
+            if start > 0 and end > 0:
+                return (int(start), int(end))
+        backend = getattr(self._spectrum_thread, 'backend_name', '') or ''
+        cfg = self._config.readout_for(backend)
+        start, end = int(cfg.bin_row_start), int(cfg.bin_row_end)
         if rows <= 0:
             return (max(1, start), max(start, end) if end > 0 else max(1, start))
         end = rows if end <= 0 or end > rows else end
@@ -622,6 +656,15 @@ class SpectrumViewerWidget(QWidget):
         if start > end:
             start, end = end, start
         return (start, end)
+
+    def _set_rows_editable(self, editable: bool):
+        """Enable the row boxes / draggable lines, or lock them (rows fixed
+        by the spectrometer's firmware: shown, not changeable)."""
+        for w in (self._row_start_spin, self._row_end_spin, self._rows_all_btn):
+            w.setEnabled(editable)
+        for line in (self._row_start_line, self._row_end_line):
+            line.setMovable(editable)
+        self._rows_fixed_label.setVisible(not editable)
 
     def refresh_bin_rows(self):
         """Sync the row spin boxes and lines from the config (called after the
@@ -650,11 +693,13 @@ class SpectrumViewerWidget(QWidget):
             end = min(max(1, int(end)), rows)
         if start > end:
             start, end = end, start
-        self._config.kymera.bin_row_start = start
-        self._config.kymera.bin_row_end = end
         if self._spectrum_thread is not None and hasattr(self._spectrum_thread,
                                                          'set_bin_rows'):
+            # Stored in the connected backend's config section by the thread.
             self._spectrum_thread.set_bin_rows(start, end)
+        else:
+            cfg = self._config.readout_for(self._config.backend)
+            cfg.bin_row_start, cfg.bin_row_end = start, end
         self.refresh_bin_rows()
 
     def _on_row_spin_changed(self, _value: int):
@@ -1015,6 +1060,21 @@ class SpectrumViewerWidget(QWidget):
             self._spectrum_curve.setData(x, self._current_spectrum)
             self._plot_widget.enableAutoRange(axis='x')
 
+    def _position_placeholder(self, *args):
+        """Keep the placeholder text in the centre of the current view."""
+        (xmin, xmax), (ymin, ymax) = self._plot_widget.plotItem.vb.viewRange()
+        self._placeholder.setPos((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
+
+    def _show_placeholder(self, text: str):
+        """Empty the plot and show ``text`` in its middle."""
+        self._current_spectrum = None
+        self._spectrum_curve.setData([], [])
+        self._baseline_curve.setData([], [])
+        self._crosshair_text.hide()
+        self._placeholder.setText(text)
+        self._position_placeholder()
+        self._placeholder.show()
+
     def _on_spectrum_ready(self, wavelengths: np.ndarray, intensities: np.ndarray, timestamp: float):
         """Handle new spectrum data with frame rate limiting."""
         import time
@@ -1046,10 +1106,17 @@ class SpectrumViewerWidget(QWidget):
         label = getattr(self._spectrum_thread, 'backend_label', '')
         if label:
             self._af_panel.setTitle(f"Spectrometer Autofocus ({label})")
-        # The Image display only exists for a 2D detector (Newton CCD).
+        self._placeholder.hide()
+        # The Spectrograph display only exists for a 2D detector (Newton CCD,
+        # or a Wasatch unit whose FPGA supports area scan). The bin rows can
+        # only be edited where the hardware takes them (Kymera; Wasatch with
+        # a firmware that has a settable vertical ROI), otherwise they are
+        # shown as fixed lines.
         is_2d = bool(getattr(self._spectrum_thread, 'supports_image_readout', False))
         self._mode_box.setVisible(is_2d)
         if is_2d:
+            self._set_rows_editable(
+                bool(getattr(self._spectrum_thread, 'supports_bin_rows', True)))
             self.refresh_bin_rows()
             if self._image_btn.isChecked():
                 self._spectrum_thread.set_image_mode(True)
@@ -1077,6 +1144,12 @@ class SpectrumViewerWidget(QWidget):
         self._af_panel.setTitle("Spectrometer Autofocus")
         self._mode_box.hide()
         self._current_frame = None
+        self._image_item.clear()
+        if self._image_btn.isChecked():
+            self._image_btn.setChecked(False)  # back to the (empty) spectrum page
+        # Nothing may be displayed from a spectrometer that is not the
+        # configured one: empty the plot and say so.
+        self._show_placeholder("No spectrometer detected")
         self._reposition_plot_overlay()
         logger.info("Spectrometer disconnected")
 

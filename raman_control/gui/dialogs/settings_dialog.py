@@ -92,7 +92,10 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
         "Which spectrometer collects the Raman signal. Auto tries the Wasatch "
         "Photonics unit first and falls back to the Andor Kymera + Newton if no "
         "Wasatch is detected. The excitation laser is always the Wasatch laser. "
-        "Takes effect on the next Connect."),
+        "Applies at once: the connected spectrometer is released and the "
+        "selected one connected; if it is absent the spectrum panel shows "
+        "'No spectrometer detected' and selecting a unit here again (or "
+        "Connect) retries."),
     'integration_time': ("Integration time (ms)", ""),
     'laser_power': ("Laser power (%)", ""),
     'laser_power_mw': ("Laser power (mW)", ""),
@@ -121,14 +124,17 @@ _FIELD_META: Dict[str, Tuple[str, str]] = {
         "of letting it warm uncontrolled"),
     'bin_row_start': (
         "Bin rows: first row",
-        "First CCD row (1-based, inclusive) summed into the spectrum. The "
-        "Newton DU920P has 256 rows. Use the Image toggle on the spectrum "
-        "plot to see where the signal lands. Applies live."),
+        "First detector row (1-based, inclusive) summed into the spectrum. "
+        "Newton DU920P: 256 rows, 1 = top. Wasatch: the unit's vertical ROI, "
+        "0 = the factory ROI from its EEPROM; only changeable on firmware "
+        "that supports a settable vertical ROI (Series-XS, or microcontroller "
+        ">= 10.0.0.47), otherwise ignored. Use the Spectrograph switch on the "
+        "spectrum plot to see where the signal lands. Applies live."),
     'bin_row_end': (
         "Bin rows: last row",
-        "Last CCD row (1-based, inclusive) summed into the spectrum. 0 = the "
-        "last row of the sensor (full vertical binning, the default). "
-        "Applies live."),
+        "Last detector row (1-based, inclusive) summed into the spectrum. "
+        "Newton: 0 = the last row (full vertical binning, the default). "
+        "Wasatch: 0 = the factory ROI. Applies live."),
     'acquisition_timeout_margin_s': (
         "Acquisition timeout margin (s)",
         "One exposure is abandoned after 2 x exposure + this margin"),
@@ -470,13 +476,22 @@ class SettingsDialog(QDialog):
         laser_note = QLabel(
             "The excitation laser is always the one on the Wasatch "
             "spectrometer-laser unit. With the Kymera selected the Wasatch is "
-            "opened for laser control only. Changing the spectrometer takes "
-            "effect on the next Connect.")
+            "opened for laser control only. Changing the spectrometer "
+            "reconnects at once; only spectra from the selected unit are shown.")
         laser_note.setWordWrap(True)
         laser_note.setStyleSheet(
             f"color: {COLORS.get('text_secondary', '#a0a0a0')}; font-size: 11px;"
             " padding: 2px 4px;")
         layout.addWidget(laser_note)
+
+        # Wasatch Photonics settings (used when that backend connects).
+        w_group = self._make_group("Wasatch Photonics")
+        w_form = QFormLayout()
+        w_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._add_dataclass_fields(w_form, self._config.spectrometer.wasatch,
+                                   "spectrometer.wasatch")
+        w_group.setLayout(w_form)
+        layout.addWidget(w_group)
 
         # Andor Kymera + Newton settings (used when that backend connects).
         k_group = self._make_group("Andor Kymera 328i + Newton DU920P")

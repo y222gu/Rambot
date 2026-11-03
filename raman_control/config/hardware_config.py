@@ -173,6 +173,24 @@ class KymeraConfig:
 
 
 @dataclass
+class WasatchConfig:
+    """Wasatch Photonics spectrometer-laser unit (the default spectrometer).
+
+    Its Hamamatsu CCD is a 2D sensor (the lab's WP-785 has an S7031-1006,
+    1024 x 64 active pixels) that the FPGA bins vertically into the spectrum.
+    The spectrum panel's Spectrograph mode reads the whole sensor through the
+    unit's "area scan" feature. The rows binned into the spectrum are the
+    unit's vertical ROI: 1-based, inclusive, 0 = "the factory ROI stored in
+    the unit's EEPROM" (default). They can only be CHANGED on units whose
+    firmware supports a settable vertical ROI (Series-XS, or Hamamatsu units
+    with microcontroller firmware >= 10.0.0.47); otherwise the factory rows
+    are used and reported, and these two values are ignored.
+    """
+    bin_row_start: int = 0
+    bin_row_end: int = 0
+
+
+@dataclass
 class SpectrometerConfig:
     """Configuration for the Raman spectrometer and excitation laser.
 
@@ -189,6 +207,7 @@ class SpectrometerConfig:
     averaging: int = 1
     excitation_wavelength_nm: float = 785.0  # laser line, for cm⁻¹ ↔ nm
     kymera: KymeraConfig = field(default_factory=KymeraConfig)
+    wasatch: WasatchConfig = field(default_factory=WasatchConfig)
 
     # Spectrometer autofocus focus metric: 'ratio' (signal band / reference
     # band, the Wasatch default below), 'entropy' (Shannon entropy of the
@@ -235,6 +254,12 @@ class SpectrometerConfig:
     def af_entropy_band(self) -> tuple:
         """(min_nm, max_nm) of the band the entropy focus metric is taken over."""
         return (self.af_entropy_min_nm, self.af_entropy_max_nm)
+
+    def readout_for(self, backend_name: str = ''):
+        """The per-backend readout settings (``bin_row_start`` /
+        ``bin_row_end``) for the spectrometer that is connected: the
+        :class:`WasatchConfig` for 'wasatch', else the :class:`KymeraConfig`."""
+        return self.wasatch if backend_name == 'wasatch' else self.kymera
 
     def resolve_af_metric(self, backend_name: str = '') -> str:
         """The focus metric to use ('ratio' / 'entropy') given the spectrometer
@@ -382,6 +407,9 @@ class HardwareConfig:
                 if key == 'spectrometer' and isinstance(value.get('kymera'), dict):
                     value = dict(value)
                     value['kymera'] = KymeraConfig(**value['kymera'])
+                if key == 'spectrometer' and isinstance(value.get('wasatch'), dict):
+                    value = dict(value)
+                    value['wasatch'] = WasatchConfig(**value['wasatch'])
                 # Convert tuple fields stored as lists back to tuples
                 for f in fields(dc_cls):
                     if f.name in value and (f.type == 'tuple' or (hasattr(f.type, '__origin__') and f.type is tuple)):

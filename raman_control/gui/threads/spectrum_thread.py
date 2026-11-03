@@ -68,7 +68,7 @@ class SpectrumThread(QThread):
     spectrum_ready = pyqtSignal(np.ndarray, np.ndarray, float)  # wavelengths, intensities, timestamp
     # Full 2D detector frame (rows, pixels) + timestamp, emitted by the live
     # loop instead of spectrum_ready while the image display is selected
-    # (Kymera/Newton, see set_image_mode).
+    # (Kymera/Newton, or a Wasatch unit with area scan; see set_image_mode).
     image_ready = pyqtSignal(np.ndarray, float)
     connected = pyqtSignal()
     disconnected = pyqtSignal()
@@ -146,6 +146,9 @@ class SpectrumThread(QThread):
         # True = whole-sensor image (see set_image_mode).
         self._image_mode = False
         self._sim_rows = 256  # simulated 2D detector height
+        # Set by request_reconnect() (Settings changed the backend): the run
+        # loop drops the current spectrometer and connects the selected one.
+        self._reconnect_requested = False
 
     # ------------------------------------------------------------------
     # Properties
@@ -212,6 +215,15 @@ class SpectrumThread(QThread):
         if self._simulated:
             return self._sim_rows
         return self._backend.detector_rows if self._backend is not None else 0
+
+    @property
+    def supports_bin_rows(self) -> bool:
+        """True when the binned rows can be changed on the connected 2D
+        detector (Kymera; Wasatch only with a firmware that takes a vertical
+        ROI). False = the rows are shown but fixed."""
+        if self._simulated:
+            return True
+        return self._backend is not None and self._backend.supports_bin_rows
 
     @property
     def image_mode(self) -> bool:
@@ -287,23 +299,58 @@ class SpectrumThread(QThread):
         logger.info("Spectrometer thread starting")
         self._running = True
 
-        # Connect to spectrometer
-        if not self._connect_spectrometer():
-            self.error.emit("Failed to connect to spectrometer")
-            self._running = False
-            return
-
-        self.connected.emit()
-        logger.info(f"Spectrometer connected "
-                    f"({'simulated' if self._simulated else self._backend_name})")
-
         # Do NOT auto-start acquisition. The spectrum is acquired only after
         # the user clicks the play button (which calls start_acquisition()).
 
         # Minimum interval between emissions to avoid overwhelming GUI
         min_emit_interval = 0.05  # 20 Hz max update rate
+        # The thread NEVER ends because a spectrometer is missing: it idles
+        # (nothing connected, GUI shows "No spectrometer detected") until
+        # Settings selects another unit or Connect asks for a retry, both via
+        # request_reconnect(). Ending here would strand the user: the Connect
+        # button already reads "Disconnect" while the other devices are up.
+        want_connect = True          # initial attempt
+        disconnect_announced = False # GUI already told nothing is connected
 
         while self._running:
+            with QMutexLocker(self._mutex):
+                reconnect = self._reconnect_requested or want_connect
+                self._reconnect_requested = False
+            if reconnect:
+                want_connect = False
+                if self._backend is not None or self._simulated:
+                    # Settings switched the spectrometer (or Connect retried):
+                    # release the current unit (and the laser-only thread,
+                    # which may hold the Wasatch) before connecting the
+                    # selected one. Spectra never come from a unit other than
+                    # the configured one.
+                    logger.info("Spectrometer selection changed to "
+                                f"'{self._config.backend}': reconnecting")
+                    self._disconnect_spectrometer()
+                    self._latest_spectrum = None
+                    with QMutexLocker(self._mutex):
+                        self._pending_settings.clear()
+                    if not disconnect_announced:
+                        self.disconnected.emit()
+                        disconnect_announced = True
+                if self._connect_spectrometer():
+                    disconnect_announced = False
+                    self.connected.emit()
+                    logger.info(f"Spectrometer connected "
+                                f"({'simulated' if self._simulated else self._backend_name})")
+                else:
+                    self.error.emit("No spectrometer detected "
+                                    f"({self._config.backend or BACKEND_AUTO})")
+                    if not disconnect_announced:
+                        self.disconnected.emit()
+                        disconnect_announced = True
+                    logger.info("Spectrometer thread idle: no spectrometer; "
+                                "waiting for a new selection or Connect")
+
+            if not self.is_connected:
+                self.msleep(100)
+                continue
+
             # Apply any queued setting changes (integration time / laser) on
             # THIS thread, before any read, so the device is never accessed
             # concurrently from a caller thread and a get_line() here.
@@ -372,7 +419,8 @@ class SpectrumThread(QThread):
 
         # Cleanup
         self._disconnect_spectrometer()
-        self.disconnected.emit()
+        if not disconnect_announced:
+            self.disconnected.emit()
         logger.info("Spectrometer thread stopped")
 
     def stop(self):
@@ -435,20 +483,47 @@ class SpectrumThread(QThread):
             self._pending_settings['integration_time_ms'] = time_ms
         logger.info(f"Integration time set to {time_ms} ms")
 
+    def request_reconnect(self):
+        """Drop the connected spectrometer (if any) and connect the one now
+        selected in the config (Settings > Spectrometer); also the way to
+        retry while the thread idles with no spectrometer. Serviced by the
+        run loop; does nothing if the thread is not running (the next start()
+        uses the new selection anyway)."""
+        if not self._running:
+            return
+        with QMutexLocker(self._mutex):
+            self._reconnect_requested = True
+        backend = self._backend
+        if backend is not None:
+            try:
+                backend.abort()  # don't wait out a long CCD exposure
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Spectrometer abort failed: {e}")
+
+    def _readout_config(self):
+        """The config section holding the bin rows of the connected (or
+        configured) spectrometer."""
+        if self._simulated:
+            return self._config.kymera
+        name = self._backend_name or (self._config.backend or '').lower()
+        return self._config.readout_for(name)
+
     def set_bin_rows(self, start: int, end: int):
         """Rows (1-based, inclusive; end 0 = last) summed into the spectrum
-        on a 2D detector. Stored in the config and applied on the spectrum
-        thread before the next exposure."""
-        self._config.kymera.bin_row_start = int(start)
-        self._config.kymera.bin_row_end = int(end)
+        on a 2D detector. Stored in the connected backend's config section
+        and applied on the spectrum thread before the next exposure (where
+        the hardware allows it, see :attr:`supports_bin_rows`)."""
+        cfg = self._readout_config()
+        cfg.bin_row_start = int(start)
+        cfg.bin_row_end = int(end)
         with QMutexLocker(self._mutex):
             self._pending_settings['bin_rows'] = (int(start), int(end))
         logger.info(f"Spectrum bin rows set to {start}-{end if end > 0 else 'last'}")
 
     def apply_readout_config(self):
         """Re-push the bin rows from the config (after the Settings dialog)."""
-        k = self._config.kymera
-        self.set_bin_rows(k.bin_row_start, k.bin_row_end)
+        cfg = self._readout_config()
+        self.set_bin_rows(cfg.bin_row_start, cfg.bin_row_end)
 
     def set_image_mode(self, on: bool):
         """Select what the live loop reads from a 2D detector: the binned

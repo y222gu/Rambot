@@ -65,7 +65,24 @@ CCD instead of the Wasatch (Settings -> Spectrometer -> "Spectrometer":
 Auto / Wasatch Photonics / Andor Kymera + Newton; Auto uses the Wasatch when
 one is detected and falls back to the Kymera). The excitation laser is always
 the one on the Wasatch spectrometer-laser unit: with the Kymera active, the
-Wasatch is opened for laser control only.
+Wasatch is opened for laser control only. Changing the spectrometer in
+Settings reconnects at once; only spectra from the selected unit are shown,
+and if it is absent the spectrum panel reads "No spectrometer detected".
+
+The spectrum panel's Spectrum | Spectrograph switch is available on both
+spectrometers: the Newton CCD, and a Wasatch unit whose FPGA supports "area
+scan" (the lab's WP-785 with its Hamamatsu S7031-1006 CCD does; this is the
+same feature as ENLIGHTEN's Area Scan view). On the Wasatch the rows binned
+into the spectrum (vertical ROI) can only be changed on firmware that allows
+it (Series-XS, or microcontroller >= 10.0.0.47); the lab unit (10.0.0.10)
+shows its factory rows as fixed lines.
+
+Both spectrometers show their detector temperature next to the spectrometer
+name in the status bar and record it in the capture metadata: the Newton CCD
+(cooled to the set point in Settings) and TEC-cooled Wasatch units, whose set
+point comes from the unit's EEPROM (-15 C on the lab's WP-785; the Wasatch
+driver turns the TEC on when it connects). "(cooling)" is shown until the
+detector is within 1 C of the set point.
 
 Andor's Python wrappers are not on PyPI. They ship with the Andor SDK
 installer (also installed by Andor SOLIS) and are installed from there into

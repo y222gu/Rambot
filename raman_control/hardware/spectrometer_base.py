@@ -11,7 +11,9 @@ Two backends exist:
 
 * :class:`~raman_control.hardware.wasatch_spectrometer.WasatchSpectrometer`:
   the Wasatch Photonics unit. The same USB device also hosts the excitation
-  laser, so this backend is additionally a :class:`LaserController`.
+  laser, so this backend is additionally a :class:`LaserController`. Its
+  Hamamatsu CCD is a 2D sensor too; when the FPGA advertises "area scan"
+  the backend can read the whole sensor (:meth:`~SpectrometerBackend.acquire_image`).
 * :class:`~raman_control.hardware.kymera_spectrometer.KymeraSpectrometer`:
   the Andor Kymera 328i spectrograph with the Newton DU920P CCD. It has no
   laser; the Wasatch laser is then driven by a separate
@@ -69,7 +71,9 @@ class SpectrometerStatus:
     """Snapshot of backend state for the GUI (polled by the thread).
 
     ``detector_temperature_c`` / ``temperature_stable`` are only meaningful
-    for cooled CCDs (Kymera/Newton); the Wasatch leaves them ``None``.
+    for cooled detectors (the Newton CCD, TEC-cooled Wasatch units);
+    uncooled units leave them ``None``. ``temperature_stable`` is None while
+    unknown (no reading yet, or no set point to compare with).
     """
     model: str = ""
     serial: str = ""
@@ -139,6 +143,15 @@ class SpectrometerBackend(ABC):
     def detector_rows(self) -> int:
         """Rows of the 2D sensor (0 for a 1D detector)."""
         return 0
+
+    @property
+    def supports_bin_rows(self) -> bool:
+        """True if :meth:`set_bin_rows` actually changes the rows the
+        hardware bins into the spectrum. False for a 2D detector whose
+        vertical binning is fixed by its firmware (older Wasatch units): the
+        frame can still be shown and :attr:`bin_rows` reports the fixed rows.
+        Default: same as :attr:`supports_image_readout`."""
+        return self.supports_image_readout
 
     def set_bin_rows(self, start: int, end: int) -> None:
         """Rows (1-based, inclusive) summed into the spectrum. ``end`` 0 =

@@ -47,9 +47,22 @@ from raman_control.core.coordinate_manager import CoordinateManager, CameraView
 from raman_control.core.slide_layout import plan_slide_hop, slide_at_position
 from raman_control.hardware.nano_piezo import NanoPiezo
 from raman_control.gui.dialogs.settings_dialog import SettingsDialog
+from raman_control.hardware.spectrometer_base import BACKEND_LABELS
 
 
 logger = get_logger('main_window')
+
+
+def spectrometer_detail_text(label: str, status) -> str:
+    """Status-bar text next to "Spectrometer": the backend label plus the live
+    detector temperature of a cooled detector (Newton CCD, TEC-cooled Wasatch)
+    and "(cooling)" while it has not reached its set point yet."""
+    temp = getattr(status, "detector_temperature_c", None)
+    if temp is None:
+        return label
+    stable = getattr(status, "temperature_stable", None)
+    mark = " (cooling)" if stable is False else ""
+    return f"{label} {temp:.0f}°C{mark}"
 
 
 class DeviceIndicator(QWidget):
@@ -580,16 +593,10 @@ class MainWindow(QMainWindow):
                     f"focus metric: {self._spectrometer.focus_metric}")
 
     def _on_spectrometer_status(self, status):
-        """Live detector temperature (Kymera/Newton) in the status bar."""
-        label = self._spectrometer.backend_label
-        temp = getattr(status, 'detector_temperature_c', None)
-        if temp is None:
-            self._status_widget.set_device_detail('Spectrometer', label)
-            return
-        stable = getattr(status, 'temperature_stable', None)
-        mark = "" if stable else " (cooling)"
+        """Live detector temperature (cooled detectors) in the status bar."""
         self._status_widget.set_device_detail(
-            'Spectrometer', f"{label} {temp:.0f}°C{mark}")
+            'Spectrometer',
+            spectrometer_detail_text(self._spectrometer.backend_label, status))
 
     def _on_laser_available_changed(self, available: bool):
         if not available and self._spectrometer.is_connected:
@@ -700,6 +707,10 @@ class MainWindow(QMainWindow):
             self._objective_camera.start()
         if not self._spectrometer.isRunning():
             self._spectrometer.start()
+        elif not self._spectrometer.is_connected:
+            # Thread idles without a spectrometer (selected unit was absent):
+            # retry the selected one.
+            self._spectrometer.request_reconnect()
         # NOTE: the LED is independent of this Connect button — it runs from
         # app launch (see _init_threads) and reconnects on demand.
 
@@ -1837,16 +1848,31 @@ class MainWindow(QMainWindow):
 
     def _on_open_settings(self):
         """Open the hardware settings dialog."""
+        old_backend = (self._config.spectrometer.backend or 'auto').lower()
         dlg = SettingsDialog(self._config, parent=self)
         if dlg.exec():
             # Pixel-size (and other) settings may have changed — refresh the
             # live view's scale bar and proximity marker, which derive their
             # size from the pixel calibration.
             self._live_view.refresh_calibration()
-            # Kymera bin rows apply live (queued to the spectrum thread); the
-            # spectrum panel's row boxes / image lines follow the config.
-            self._spectrometer.apply_readout_config()
-            self._spectrum_viewer.refresh_bin_rows()
+            new_backend = (self._config.spectrometer.backend or 'auto').lower()
+            running = self._spectrometer.isRunning()
+            if running and (new_backend != old_backend
+                            or not self._spectrometer.is_connected):
+                # Spectra must only come from the selected spectrometer: drop
+                # the current unit and connect the new one (on the spectrum
+                # thread). If it is absent the thread idles and the panel
+                # shows "No spectrometer detected"; selecting a unit again
+                # here (or Connect) retries, so the user is never stranded.
+                label = BACKEND_LABELS.get(new_backend, new_backend)
+                self._status_widget.show_message(
+                    f"Connecting spectrometer: {label}...", 5000)
+                self._spectrometer.request_reconnect()
+            else:
+                # Bin rows apply live (queued to the spectrum thread); the
+                # spectrum panel's row boxes / image lines follow the config.
+                self._spectrometer.apply_readout_config()
+                self._spectrum_viewer.refresh_bin_rows()
 
     def _show_about(self):
         QMessageBox.about(

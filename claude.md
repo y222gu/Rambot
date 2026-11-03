@@ -98,6 +98,43 @@ QPushButton:pressed {
   - Controllable parameters: integration time, laser power
   - Real-time spectrum display needed
   - Critical for autofocus feedback
+  - Lab unit: WP-785-C2-ER-LMM, serial WP-01000, Hamamatsu S7031-1006 CCD
+    (2D, 1024 x 64 active rows), microcontroller fw 10.0.0.10, FPGA 030-107,
+    FPGA option `has_area_scan` = True, EEPROM vertical ROI rows 0-63
+  - Spectrograph mode also works here (`hardware/wasatch_spectrometer.py`):
+    `acquire_image` enables the unit's AREA SCAN (`fid.set_area_scan_enable`,
+    opcode 0xeb), sends ACQUIRE (0xad) and reads the rows itself from bulk
+    endpoint 0x82 until the pipe runs dry (`_read_area_scan_frame`); the next
+    `acquire` disables it before `get_line()`. Same feature as ENLIGHTEN's
+    "Area Scan" view. Do NOT use the driver's `fid.get_area_scan()`: it only
+    accepts rows with a 0xffff marker + row index and assumes exactly 69
+    rows; the lab unit streams 69 rows of plain pixel data (no marker, no
+    index, in order) and a second ACQUIRE with bytes left in the pipe gives
+    a libusb pipe error. `supports_image_readout` is only True when the FPGA
+    advertises area scan (never on InGaAs)
+  - The rows binned into the spectrum are the unit's vertical ROI. They are
+    only settable (`fid.set_vertical_roi`) on Series-XS or microcontroller
+    fw >= 10.0.0.47 (`FirmwareRequirements`): the lab unit CANNOT, so
+    `supports_bin_rows` is False and the GUI shows the factory rows as
+    locked lines ("fixed by firmware"). `WasatchConfig.bin_row_*` (0/0 =
+    factory ROI) is only applied on capable firmware
+  - The lab unit's CCD is TEC-cooled (EEPROM `has_cooling`): Wasatch.PY
+    writes the EEPROM start-up set point (-15 C) and enables the TEC in its
+    own connect. `WasatchSpectrometer.poll()` reads the detector temperature
+    (`get_detector_temperature_degC`, opcode 0xd7) about once a second into
+    `SpectrometerStatus`, the same path as the Kymera/Newton: status bar
+    "Wasatch Photonics -15 C" with "(cooling)" until within 1 C of the set
+    point (`TEC_STABLE_BAND_C`), and "Detector temperature (C)" in capture
+    metadata. Uncooled units leave it None
+  - Changing `SpectrometerConfig.backend` in Settings calls
+    `SpectrumThread.request_reconnect()`: the current unit (and the
+    laser-only thread) is released and the selected one connected on the
+    spectrum thread. Spectra are shown ONLY from the selected spectrometer;
+    if it is absent, `disconnected` + `error` fire, the spectrum panel shows
+    an empty plot with "No spectrometer detected" and the thread stays
+    ALIVE but idle (never let it end on a missing unit: the Connect button
+    reads "Disconnect" while the other devices are up, so the user would be
+    stranded). Settings OK or Connect call `request_reconnect()` to retry
 
 - **Alternative spectrometer: Andor Kymera 328i + Newton DU920P CCD**
   - Driven through Andor's `pyAndorSDK2` (camera) + `pyAndorSpectrograph`
@@ -115,7 +152,9 @@ QPushButton:pressed {
     spectra. Never derive a spectrum by
     summing image rows in software (per-pixel bias x N, ~20x higher baseline).
     `acquire_frames` (autofocus/acquisition) always takes spectra. Rows apply
-    live via `set_bin_rows` / `apply_readout_config`, no reconnect
+    live via `set_bin_rows` / `apply_readout_config`, no reconnect. Bin rows
+    live in the connected backend's config section
+    (`SpectrometerConfig.readout_for(backend_name)`: `kymera` or `wasatch`)
   - Has NO laser: the Wasatch unit still provides the 785 nm excitation and is
     then opened for laser control only (`hardware/wasatch_laser.py` on
     `gui/threads/laser_thread.py`)

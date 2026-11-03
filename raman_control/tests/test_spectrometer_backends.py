@@ -181,14 +181,22 @@ def test_connect_fails_when_no_backend_available(monkeypatch):
     spec = SpectrumThread(SpectrometerConfig(backend='auto'))
     patch_candidates(monkeypatch, spec, [FakeBackend('wasatch', False),
                                          FakeBackend('kymera', False)])
+    errors = []
+    spec.error.connect(lambda m: errors.append(m), Qt.ConnectionType.DirectConnection)
     t = threading.Thread(target=spec.run, daemon=True)
     t.start()
-    t.join(2)
-    # run() must return (not loop) when nothing connects, leaving no backend.
-    assert not t.is_alive()
+    deadline = time.time() + 2.0
+    while not errors and time.time() < deadline:
+        time.sleep(0.01)
+    # Nothing connects: no backend, "No spectrometer detected", and the
+    # thread idles (stays alive) so a later selection / Connect can retry.
+    assert errors and errors[0].startswith("No spectrometer detected")
+    assert t.is_alive()
     assert not spec.is_connected
     assert spec._backend is None
     assert spec.backend_name == ''
+    stop_thread(spec, t)
+    assert not t.is_alive()
 
 
 def test_wasatch_backend_handles_laser_itself(monkeypatch):
